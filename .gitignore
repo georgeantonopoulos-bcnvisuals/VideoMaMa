@@ -193,5 +193,6 @@ test_ablation.sh
 /src/vos_loss.py
 # Local inference setup artifacts
 /.venv/
+/.venv-sam2-ui/
 /checkpoints/
 /tmp/

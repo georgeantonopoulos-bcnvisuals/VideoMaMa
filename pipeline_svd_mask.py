@@ -7,7 +7,8 @@ from typing import Callable, Dict, List, Optional, Union
 import numpy as np
 import PIL.Image
 import torch
-from transformers import CLIPImageProcessor, CLIPVisionModelWithProjection
+from transformers.models.clip.image_processing_clip import CLIPImageProcessor
+from transformers.models.clip.modeling_clip import CLIPVisionModelWithProjection
 
 from diffusers.image_processor import PipelineImageInput
 from diffusers.models import AutoencoderKLTemporalDecoder, UNetSpatioTemporalConditionModel
@@ -832,7 +833,8 @@ from PIL import Image
 from einops import rearrange
 from torchvision import transforms
 from diffusers import AutoencoderKLTemporalDecoder, UNetSpatioTemporalConditionModel
-from transformers import CLIPImageProcessor, CLIPVisionModelWithProjection
+from transformers.models.clip.image_processing_clip import CLIPImageProcessor
+from transformers.models.clip.modeling_clip import CLIPVisionModelWithProjection
 
 
 class VideoInferencePipeline:
