@@ -905,7 +905,11 @@ class VideoInferencePipeline:
             first_frame_tensor = cond_video_tensor[:, 0, :, :, :]
             pixel_values_for_clip = self._resize_with_antialiasing(first_frame_tensor, (224, 224))
             pixel_values_for_clip = ((pixel_values_for_clip + 1.0) / 2.0).clamp(0, 1)
-            pixel_values = self.feature_extractor(images=pixel_values_for_clip, return_tensors="pt").pixel_values
+            pixel_values = self.feature_extractor(
+                images=pixel_values_for_clip,
+                do_rescale=False,
+                return_tensors="pt",
+            ).pixel_values
             image_embeddings = self.image_encoder(pixel_values.to(self.device, dtype=self.weight_dtype)).image_embeds
             encoder_hidden_states = torch.zeros_like(image_embeddings).unsqueeze(1)
 

@@ -77,6 +77,35 @@ python inference_onestep_folder.py \
 
 ---
 
+## Rocky Linux Local Setup
+
+For a local Rocky Linux GPU machine, use the repository script below instead of `scripts/setup.sh`.
+The original setup script assumes Ubuntu `apt`, Git LFS, and `conda`.
+
+```bash
+bash scripts/setup_rocky_inference.sh
+source .venv/bin/activate
+```
+
+This creates `.venv`, installs inference-only Python dependencies, and downloads both required Hugging Face checkpoints into `checkpoints/` without Git LFS.
+
+## EXR Input Support
+
+`inference_onestep_folder.py` can read `.exr` frames directly for both image and mask sequences.
+RGB EXR frames are converted to 8-bit RGB for the model, and mask EXR frames use a preferred channel via `--mask_channel`.
+
+Useful flags:
+
+* `--exr_gamma`: Display gamma used for RGB EXR conversion. Default: `2.2`
+* `--exr_exposure`: Exposure offset in stops before gamma conversion. Default: `0.0`
+* `--mask_channel`: Preferred EXR mask channel, such as `A`, `Y`, or `R`. Default: `A`
+
+Example:
+
+```bash
+python inference_onestep_folder.py     --base_model_path checkpoints/stable-video-diffusion-img2vid-xt     --unet_checkpoint_path checkpoints/VideoMaMa     --image_root_path /path/to/image_exr_sequences     --mask_root_path /path/to/mask_sequences     --output_dir output_exr     --keep_aspect_ratio     --mask_channel A     --exr_gamma 2.2     --exr_exposure 0.0
+```
+
 ## Output Structure
 
 The script will generate an output directory with the following structure:

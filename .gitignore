@@ -191,3 +191,7 @@ test_ablation.sh
 /src/video_html_generation.py
 /src/original_inference.py
 /src/vos_loss.py
+# Local inference setup artifacts
+/.venv/
+/checkpoints/
+/tmp/

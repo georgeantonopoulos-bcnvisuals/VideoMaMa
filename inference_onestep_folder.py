@@ -16,6 +16,13 @@ from pipeline_svd_mask import VideoInferencePipeline
 # --- Dependency Check ---
 check_min_version("0.24.0.dev0")
 
+try:
+    import OpenEXR
+    import Imath
+except ImportError:
+    OpenEXR = None
+    Imath = None
+
 
 # =================================================================================
 # Data Loading and Augmentation Helpers
@@ -49,8 +56,80 @@ def _resize_with_aspect_ratio(image, target_width, target_height):
     return resized_image
 
 
+def _read_exr_image(image_path, image_mode, exr_gamma=2.2, exr_exposure=0.0, mask_channel="A"):
+    if OpenEXR is None or Imath is None:
+        raise ImportError(
+            "OpenEXR support requires the 'OpenEXR' and 'Imath' Python packages. "
+            "Install them in the inference environment to read .exr files."
+        )
+
+    exr_file = OpenEXR.InputFile(image_path)
+    header = exr_file.header()
+    data_window = header["dataWindow"]
+    width = data_window.max.x - data_window.min.x + 1
+    height = data_window.max.y - data_window.min.y + 1
+    channels = header["channels"]
+    available_channels = set(channels.keys())
+    float_type = Imath.PixelType(Imath.PixelType.FLOAT)
+
+    def read_channel(channel_name):
+        raw = exr_file.channel(channel_name, float_type)
+        return np.frombuffer(raw, dtype=np.float32).reshape(height, width)
+
+    if image_mode == "RGB":
+        rgb_channels = []
+        for channel_name in ("R", "G", "B"):
+            if channel_name in available_channels:
+                rgb_channels.append(read_channel(channel_name))
+            else:
+                rgb_channels.append(np.zeros((height, width), dtype=np.float32))
+
+        image = np.stack(rgb_channels, axis=-1)
+        image = np.nan_to_num(image, nan=0.0, posinf=1.0, neginf=0.0)
+        image = np.clip(image * (2.0 ** exr_exposure), 0.0, None)
+        image = np.clip(image, 0.0, 1.0) ** (1.0 / exr_gamma)
+        image = (image * 255.0).round().astype(np.uint8)
+        return Image.fromarray(image)
+
+    if image_mode == "L":
+        if mask_channel in available_channels:
+            channel = read_channel(mask_channel)
+        elif "Y" in available_channels:
+            channel = read_channel("Y")
+        elif "A" in available_channels:
+            channel = read_channel("A")
+        elif "R" in available_channels:
+            channel = read_channel("R")
+        else:
+            raise ValueError(
+                f"Could not find a usable mask channel in {image_path}. "
+                f"Available channels: {sorted(available_channels)}"
+            )
+
+        channel = np.nan_to_num(channel, nan=0.0, posinf=1.0, neginf=0.0)
+        channel = np.clip(channel, 0.0, 1.0)
+        channel = (channel * 255.0).round().astype(np.uint8)
+        return Image.fromarray(channel)
+
+    raise ValueError(f"Unsupported image mode for EXR reading: {image_mode}")
+
+
+def _load_frame(image_path, image_mode, exr_gamma=2.2, exr_exposure=0.0, mask_channel="A"):
+    extension = os.path.splitext(image_path)[1].lower()
+    if extension == ".exr":
+        return _read_exr_image(
+            image_path,
+            image_mode=image_mode,
+            exr_gamma=exr_gamma,
+            exr_exposure=exr_exposure,
+            mask_channel=mask_channel,
+        )
+
+    return Image.open(image_path).convert(image_mode)
+
+
 def load_image_sequence(image_folder, mask_folder, num_frames_to_generate, num_frames_to_read, width, height,
-                        keep_aspect_ratio=False):
+                        keep_aspect_ratio=False, exr_gamma=2.2, exr_exposure=0.0, mask_channel="A"):
     """
     Loads a sequence of images and corresponding masks from folders.
     """
@@ -80,8 +159,20 @@ def load_image_sequence(image_folder, mask_folder, num_frames_to_generate, num_f
 
         mask_path = os.path.join(mask_folder, mask_filename)
 
-        cond_image_pil = Image.open(image_path).convert("RGB")
-        mask_image_pil = Image.open(mask_path).convert("L")
+        cond_image_pil = _load_frame(
+            image_path,
+            image_mode="RGB",
+            exr_gamma=exr_gamma,
+            exr_exposure=exr_exposure,
+            mask_channel=mask_channel,
+        )
+        mask_image_pil = _load_frame(
+            mask_path,
+            image_mode="L",
+            exr_gamma=exr_gamma,
+            exr_exposure=exr_exposure,
+            mask_channel=mask_channel,
+        )
 
         if keep_aspect_ratio:
             resized_cond = _resize_with_aspect_ratio(cond_image_pil, width, height)
@@ -288,6 +379,12 @@ if __name__ == "__main__":
     parser.add_argument("--erosion_dilation_kernel_size", type=int, default=5,
                         help="Kernel size for the erosion and dilation operations.")
     parser.add_argument("--input_threshold", type=int, default=127)
+    parser.add_argument("--exr_gamma", type=float, default=2.2,
+                        help="Display gamma used when converting RGB EXR frames to 8-bit RGB.")
+    parser.add_argument("--exr_exposure", type=float, default=0.0,
+                        help="Exposure offset in stops applied before EXR gamma conversion.")
+    parser.add_argument("--mask_channel", type=str, default="A",
+                        help="Preferred EXR channel name for mask inputs, e.g. A, Y, or R.")
 
     args = parser.parse_args()
     if args.num_input_frames is None:
@@ -324,7 +421,10 @@ if __name__ == "__main__":
                 num_frames_to_generate=args.num_frames,
                 num_frames_to_read=args.num_input_frames,
                 width=args.width, height=args.height,
-                keep_aspect_ratio=args.keep_aspect_ratio
+                keep_aspect_ratio=args.keep_aspect_ratio,
+                exr_gamma=args.exr_gamma,
+                exr_exposure=args.exr_exposure,
+                mask_channel=args.mask_channel
             )
 
             # Apply binary threshold and optional augmentation to masks
