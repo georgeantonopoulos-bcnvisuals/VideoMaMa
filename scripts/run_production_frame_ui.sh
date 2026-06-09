@@ -23,6 +23,7 @@ if [[ ! -d "${UI_VENV}" ]]; then
   echo "Missing SAM 3 UI environment: ${UI_VENV}" >&2
   echo "Bootstrap it first:" >&2
   echo "  bash ${REPO_ROOT}/scripts/bootstrap_tmp_venv.sh sam3-ui" >&2
+  echo "The bootstrap script will auto-detect python3.12 from PATH or pyenv." >&2
   exit 1
 fi
 

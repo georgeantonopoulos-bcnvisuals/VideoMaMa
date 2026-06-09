@@ -28,11 +28,53 @@ UI_VENV="${VIDEOMAMA_UI_VENV:-/tmp/videomama-sam3-ui-venv}"
 INFER_TORCH_INDEX_URL="${INFER_TORCH_INDEX_URL:-https://download.pytorch.org/whl/cu124}"
 UI_TORCH_INDEX_URL="${UI_TORCH_INDEX_URL:-https://download.pytorch.org/whl/cu128}"
 PYTHON_INFER_BIN="${PYTHON_INFER_BIN:-python3.9}"
-PYTHON_UI_BIN="${PYTHON_UI_BIN:-python3.12}"
+PYTHON_UI_BIN="${PYTHON_UI_BIN:-}"
+PYENV_ROOT="${PYENV_ROOT:-${HOME}/.pyenv}"
+PYENV_BIN="${PYENV_BIN:-${PYENV_ROOT}/bin/pyenv}"
 
 target="${1:-all}"
 
 log() { printf '[videomama-bootstrap] %s\n' "$*"; }
+
+resolve_pyenv_python() {
+  local version_prefix="$1"
+  local pyenv_cmd=""
+
+  if command -v pyenv >/dev/null 2>&1; then
+    pyenv_cmd="$(command -v pyenv)"
+  elif [[ -x "${PYENV_BIN}" ]]; then
+    pyenv_cmd="${PYENV_BIN}"
+  else
+    return 1
+  fi
+
+  local version
+  version="$("${pyenv_cmd}" versions --bare | awk -v prefix="${version_prefix}" '$0 ~ "^" prefix "(\\.|$)" { print; exit }')"
+  if [[ -z "${version}" ]]; then
+    return 1
+  fi
+
+  PYENV_VERSION="${version}" "${pyenv_cmd}" which python
+}
+
+resolve_ui_python() {
+  if [[ -n "${PYTHON_UI_BIN}" ]]; then
+    printf '%s\n' "${PYTHON_UI_BIN}"
+    return 0
+  fi
+
+  if command -v python3.12 >/dev/null 2>&1; then
+    command -v python3.12
+    return 0
+  fi
+
+  if resolved="$(resolve_pyenv_python "3.12")"; then
+    printf '%s\n' "${resolved}"
+    return 0
+  fi
+
+  printf '%s\n' "python3.12"
+}
 
 check_python() {
   local bin="$1" label="$2"
@@ -61,6 +103,7 @@ build_inference_venv() {
 }
 
 build_ui_venv() {
+  PYTHON_UI_BIN="$(resolve_ui_python)"
   log "Building SAM 3 UI venv at ${UI_VENV} (Python: ${PYTHON_UI_BIN})"
   check_python "${PYTHON_UI_BIN}" "ui"
 
@@ -85,6 +128,7 @@ export VIDEOMAMA_ROOT="${REPO_ROOT}"
 export VIDEOMAMA_CHECKPOINTS="${CHECKPOINTS_DIR}"
 export VIDEOMAMA_VENV="${INFER_VENV}"
 export VIDEOMAMA_UI_VENV="${UI_VENV}"
+export VIDEOMAMA_UI_PYTHON="${PYTHON_UI_BIN}"
 export VIDEOMAMA_BASE_MODEL_PATH="\${VIDEOMAMA_BASE_MODEL_PATH:-${CHECKPOINTS_DIR}/stable-video-diffusion-img2vid-xt}"
 export VIDEOMAMA_UNET_CHECKPOINT_PATH="\${VIDEOMAMA_UNET_CHECKPOINT_PATH:-${CHECKPOINTS_DIR}/VideoMaMa}"
 EOF

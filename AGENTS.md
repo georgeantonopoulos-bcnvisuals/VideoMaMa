@@ -52,6 +52,11 @@ bash scripts/bootstrap_tmp_venv.sh inference
 bash scripts/bootstrap_tmp_venv.sh sam3-ui
 ```
 
+For `sam3-ui`, the bootstrap script auto-detects `python3.12` from `PATH` or a
+pyenv-installed 3.12 under `~/.pyenv`. Override with `PYTHON_UI_BIN=/path/to/python`
+when needed. The launch script activates the built UI venv; it does not create
+the venv itself.
+
 Launch the production SAM 3 + VideoMaMa UI:
 
 ```bash

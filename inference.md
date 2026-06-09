@@ -111,6 +111,15 @@ source .videomama-env                     # exports VIDEOMAMA_CHECKPOINTS etc.
 source "$VIDEOMAMA_VENV/bin/activate"     # inference venv
 ```
 
+For the SAM 3 UI environment, `scripts/bootstrap_tmp_venv.sh sam3-ui`
+automatically looks for `python3.12` on `PATH` first, then for an installed
+pyenv 3.12 interpreter under `~/.pyenv`. Override with `PYTHON_UI_BIN` if the
+interpreter lives somewhere else:
+
+```bash
+PYTHON_UI_BIN="$HOME/.pyenv/versions/3.12.3/bin/python" bash scripts/bootstrap_tmp_venv.sh sam3-ui
+```
+
 Launch the production SAM 3 UI:
 
 ```bash
