@@ -19,10 +19,22 @@ class SAM3VideoTracker:
     def __init__(self, device="cuda", gpus_to_use: Optional[List[int]] = None):
         try:
             from sam3.model_builder import build_sam3_video_predictor
+        except ModuleNotFoundError as exc:
+            missing_module = exc.name or "unknown"
+            if missing_module == "sam3":
+                raise RuntimeError(
+                    "SAM 3 is not installed. Build the production UI environment with "
+                    "`bash scripts/bootstrap_tmp_venv.sh sam3-ui`."
+                ) from exc
+            raise RuntimeError(
+                f"SAM 3 dependency import failed because `{missing_module}` is missing. "
+                "Refresh the SAM 3 UI environment with "
+                "`/tmp/videomama-sam3-ui-venv/bin/python -m pip install -r scripts/requirements-sam3-ui.txt`."
+            ) from exc
         except ImportError as exc:
             raise RuntimeError(
-                "SAM 3 is not installed. Build the production UI environment with "
-                "`bash scripts/bootstrap_tmp_venv.sh sam3-ui`."
+                "SAM 3 failed to import. Refresh the production UI environment with "
+                "`/tmp/videomama-sam3-ui-venv/bin/python -m pip install -r scripts/requirements-sam3-ui.txt`."
             ) from exc
 
         self.device = device
