@@ -201,6 +201,7 @@ class SAM3VideoTracker:
                 request={
                     "type": "propagate_in_video",
                     "session_id": session_id,
+                    "start_frame_index": keyframes[0],
                 }
             ):
                 frame_idx = int(response["frame_index"])
