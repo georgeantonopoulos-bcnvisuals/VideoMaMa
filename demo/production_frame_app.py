@@ -1,8 +1,8 @@
 """
-Production sequence UI for multi-keyframe SAM2 prompting + VideoMaMa inference.
+Production sequence UI for multi-keyframe SAM 3 prompting + VideoMaMa inference.
 
-This app is intended for Python 3.10+ environments because the upstream `sam2`
-package does not support Python 3.9.
+This app is intended for Python 3.12+ environments because SAM 3 requires a
+newer Python/PyTorch stack than the base VideoMaMa inference environment.
 """
 
 import json
@@ -47,7 +47,7 @@ try:
 except ImportError as exc:
     raise RuntimeError("OpenEXR and Imath are required for production_frame_app.py") from exc
 
-from sam2_wrapper_hf import load_sam2_tracker
+from sam3_wrapper_hf import load_sam3_tracker
 from videomama_wrapper import load_videomama_pipeline, videomama
 from tools.painter import mask_painter, point_painter
 
@@ -65,7 +65,7 @@ POINT_ALPHA = 0.9
 POINT_RADIUS = 15
 SUPPORTED_IMAGE_EXTS = {".exr", ".png", ".jpg", ".jpeg", ".tif", ".tiff"}
 
-sam2_tracker = None
+sam3_tracker = None
 videomama_pipeline = None
 
 
@@ -124,25 +124,16 @@ def _run_root(base_name: str):
 
 
 def initialize_models():
-    global sam2_tracker, videomama_pipeline
-    if sam2_tracker is not None and videomama_pipeline is not None:
+    global sam3_tracker, videomama_pipeline
+    if sam3_tracker is not None and videomama_pipeline is not None:
         return "Models already loaded."
 
     import torch
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    checkpoints_root = os.environ.get(
-        "VIDEOMAMA_CHECKPOINTS",
-        "/mnt/production/project/bcn_lib/work/AI/VideoMaMa/checkpoints",
-    )
-    sam2_ckpt = os.environ.get(
-        "SAM2_CHECKPOINT_PATH",
-        os.path.join(checkpoints_root, "sam2.1_hiera_large.pt"),
-    )
-
-    sam2_tracker = load_sam2_tracker(checkpoint_path=sam2_ckpt, device=device)
+    sam3_tracker = load_sam3_tracker(device=device)
     videomama_pipeline = load_videomama_pipeline(device=device)
-    return f"Loaded SAM2 and VideoMaMa on {device}."
+    return f"Loaded SAM 3 and VideoMaMa on {device}."
 
 
 def _keyframe_summary(state):
@@ -208,9 +199,9 @@ def _load_current_mask(state, frame_idx):
 def _compute_preview_mask(state, frame_idx):
     prompts = _prompt_data_for_frame(state, frame_idx)
     preview_masks = state.setdefault('preview_masks', {})
-    if prompts['points'] and sam2_tracker is not None:
+    if prompts['points'] and sam3_tracker is not None:
         frame = _load_cached_frame(state, frame_idx)
-        mask = sam2_tracker.get_frame_mask(frame, prompts['points'], prompts['labels'])
+        mask = sam3_tracker.get_frame_mask(frame, prompts['points'], prompts['labels'])
         preview_masks[str(frame_idx)] = mask.astype(np.uint8).tolist()
         return mask
 
@@ -264,12 +255,12 @@ def _ui_state_payload(state, status_message):
 def load_sequence(sequence_dir: str, exr_gamma: float):
     frame_paths = _discover_sequence_files(sequence_dir)
     run_root = _run_root(Path(sequence_dir).name)
-    cache_dir = run_root / 'sam2_frames'
+    cache_dir = run_root / 'sam3_frames'
     cache_dir.mkdir(parents=True, exist_ok=True)
 
     cache_frame_paths = []
     original_sizes = []
-    print(f"Preparing {len(frame_paths)} frames for SAM2/UI cache...")
+    print(f"Preparing {len(frame_paths)} frames for SAM 3/UI cache...")
     for idx, frame_path in enumerate(frame_paths):
         frame = _load_rgb_frame(str(frame_path), exr_gamma=exr_gamma)
         original_sizes.append([int(frame.shape[1]), int(frame.shape[0])])
@@ -336,7 +327,7 @@ def next_frame(state):
 def add_point(state, point_mode, evt: gr.SelectData):
     if state is None:
         raise gr.Error('Load a sequence first.')
-    if sam2_tracker is None:
+    if sam3_tracker is None:
         raise gr.Error('Initialize models first.')
     if evt is None or evt.index is None:
         raise gr.Error('Click data was not received by Gradio.')
@@ -396,28 +387,28 @@ def _normalized_prompt_dict(state):
     return prompts
 
 
-def generate_sam2_masks(state):
+def generate_sam3_masks(state):
     if state is None:
         raise gr.Error('Load a sequence first.')
-    if sam2_tracker is None:
+    if sam3_tracker is None:
         raise gr.Error('Initialize models first.')
 
     prompts = _normalized_prompt_dict(state)
     run_root = Path(state['run_root'])
-    mask_dir = run_root / 'sam2_masks'
+    mask_dir = run_root / 'sam3_masks'
     mask_dir.mkdir(parents=True, exist_ok=True)
 
     with (run_root / 'keyframe_prompts.json').open('w', encoding='utf-8') as f:
         json.dump({str(k): v for k, v in prompts.items()}, f, indent=2)
 
-    masks = sam2_tracker.track_video_from_dir(state['cache_dir'], prompts)
+    masks = sam3_tracker.track_video_from_dir(state['cache_dir'], prompts)
     for frame_name, mask in zip(state['frame_names'], masks):
         Image.fromarray(mask).save(mask_dir / f"{Path(frame_name).stem}.png")
 
     state['generated_masks_dir'] = str(mask_dir)
     state['videomama_output_dir'] = None
     state['alpha_output_dir'] = None
-    return _ui_state_payload(state, f"Generated {len(masks)} SAM2 masks using {_keyframe_summary(state)}")
+    return _ui_state_payload(state, f"Generated {len(masks)} SAM 3 masks using {_keyframe_summary(state)}")
 
 
 def run_sequence(state, chunk_size, overlap):
@@ -427,7 +418,7 @@ def run_sequence(state, chunk_size, overlap):
         raise gr.Error('Initialize models first.')
 
     if not state.get('generated_masks_dir'):
-        state = generate_sam2_masks(state)[3]
+        state = generate_sam3_masks(state)[3]
 
     total_frames = len(state['frame_paths'])
     chunk_size = max(1, int(chunk_size))
@@ -453,7 +444,7 @@ def run_sequence(state, chunk_size, overlap):
         for frame_name in chunk_frame_names:
             mask_path = Path(state['generated_masks_dir']) / f"{Path(frame_name).stem}.png"
             if not mask_path.exists():
-                raise gr.Error(f"Missing SAM2 mask for {frame_name}: {mask_path}")
+                raise gr.Error(f"Missing SAM 3 mask for {frame_name}: {mask_path}")
             masks_np.append(np.array(Image.open(mask_path).convert('L')))
 
         output_frames = videomama(videomama_pipeline, frames_np, masks_np)
@@ -479,8 +470,8 @@ def run_sequence(state, chunk_size, overlap):
 
 with gr.Blocks(title='VideoMaMa Production Sequence App') as demo:
     gr.Markdown('# VideoMaMa Production Sequence App')
-    gr.Markdown('Load an EXR or image sequence, add SAM2 prompts on multiple keyframes, generate the full mask track, then run VideoMaMa over the whole shot.')
-    gr.Markdown('Workflow: Initialize models, load the sequence, navigate frames, add prompts on the frames that need correction, generate SAM2 masks, then run the whole sequence.')
+    gr.Markdown('Load an EXR or image sequence, add SAM 3 prompts on multiple keyframes, generate the full mask track, then run VideoMaMa over the whole shot.')
+    gr.Markdown('Workflow: Initialize models, load the sequence, navigate frames, add prompts on the frames that need correction, generate SAM 3 masks, then run the whole sequence.')
 
     state = gr.State(None)
 
@@ -501,7 +492,7 @@ with gr.Blocks(title='VideoMaMa Production Sequence App') as demo:
         undo_btn = gr.Button('Undo Point')
         clear_frame_btn = gr.Button('Clear Frame Points')
         clear_all_btn = gr.Button('Clear All Prompts')
-        gen_masks_btn = gr.Button('Generate SAM2 Masks')
+        gen_masks_btn = gr.Button('Generate SAM 3 Masks')
         run_btn = gr.Button('Run Whole Sequence')
 
     frame_slider = gr.Slider(label='Current Frame', minimum=0, maximum=0, value=0, step=1, interactive=False)
@@ -517,7 +508,7 @@ with gr.Blocks(title='VideoMaMa Production Sequence App') as demo:
             show_download_button=False,
             show_fullscreen_button=False,
         )
-        mask_img = gr.Image(label='Current SAM2 Mask', type='numpy')
+        mask_img = gr.Image(label='Current SAM 3 Mask', type='numpy')
         output_img = gr.Image(label='Current VideoMaMa Output', type='numpy')
 
     mask_dir = gr.Textbox(label='Saved Mask Directory')
@@ -566,7 +557,7 @@ with gr.Blocks(title='VideoMaMa Production Sequence App') as demo:
         outputs=[preview, mask_img, output_img, state, frame_slider, frame_info, keyframes_info, mask_dir, output_dir, status],
     )
     gen_masks_btn.click(
-        generate_sam2_masks,
+        generate_sam3_masks,
         inputs=state,
         outputs=[preview, mask_img, output_img, state, frame_slider, frame_info, keyframes_info, mask_dir, output_dir, status],
     )

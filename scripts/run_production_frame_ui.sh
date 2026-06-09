@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Launch the SAM2 + VideoMaMa production sequence UI.
+# Launch the SAM 3 + VideoMaMa production sequence UI.
 #
 # Resolves venv + checkpoint paths from .videomama-env (written by
 # bootstrap_tmp_venv.sh). Override any of those env vars in the calling shell
@@ -17,12 +17,12 @@ if [[ -f "${ENV_FILE}" ]]; then
   source "${ENV_FILE}"
 fi
 
-UI_VENV="${VIDEOMAMA_UI_VENV:-/tmp/videomama-sam2-ui-venv}"
+UI_VENV="${VIDEOMAMA_UI_VENV:-/tmp/videomama-sam3-ui-venv}"
 
 if [[ ! -d "${UI_VENV}" ]]; then
-  echo "Missing SAM2 UI environment: ${UI_VENV}" >&2
+  echo "Missing SAM 3 UI environment: ${UI_VENV}" >&2
   echo "Bootstrap it first:" >&2
-  echo "  bash ${REPO_ROOT}/scripts/bootstrap_tmp_venv.sh sam2-ui" >&2
+  echo "  bash ${REPO_ROOT}/scripts/bootstrap_tmp_venv.sh sam3-ui" >&2
   exit 1
 fi
 

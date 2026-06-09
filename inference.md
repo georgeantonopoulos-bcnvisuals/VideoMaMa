@@ -100,7 +100,7 @@ rebuilds its venvs locally on `/tmp`:
 | Weights                      | `/mnt/production/project/bcn_lib/work/AI/VideoMaMa/checkpoints/`    |
 | Code/config                  | `/mnt/production/user/<username>/DEV/AI/VideoMama/`                 |
 | Inference venv (Python 3.9)  | `/tmp/videomama-venv/`                                              |
-| SAM2 UI venv (Python 3.10)   | `/tmp/videomama-sam2-ui-venv/`                                      |
+| SAM 3 UI venv (Python 3.12)  | `/tmp/videomama-sam3-ui-venv/`                                      |
 
 ### Bootstrap on any similar machine
 
@@ -111,7 +111,7 @@ source .videomama-env                     # exports VIDEOMAMA_CHECKPOINTS etc.
 source "$VIDEOMAMA_VENV/bin/activate"     # inference venv
 ```
 
-Launch the production SAM2 UI:
+Launch the production SAM 3 UI:
 
 ```bash
 bash scripts/run_production_frame_ui.sh
@@ -125,16 +125,19 @@ VIDEOMAMA_CHECKPOINTS=/some/other/path bash scripts/bootstrap_tmp_venv.sh
 
 ### Requirements
 
-* Python 3.9 for the inference venv, Python 3.10 for the SAM2 UI (the upstream
-  `sam2` package does not support 3.9). `pyenv` is a convenient way to provide
-  both.
-* CUDA 12.4 capable GPU driver (matches the pinned torch 2.4.0 wheels).
+* Python 3.9 for the inference venv, Python 3.12 for the SAM 3 UI. `pyenv` is
+  a convenient way to provide both.
+* CUDA 12.4 capable GPU driver for the inference venv. SAM 3 follows Meta's
+  current requirement of PyTorch 2.7+ and CUDA 12.6+; the bootstrap uses
+  PyTorch 2.10.0 CUDA 12.8 wheels for the UI venv.
 * Read access to `/mnt/production/project/bcn_lib/work/AI/VideoMaMa/` and
   write access to `/tmp`.
 
 The CLI entry points read `VIDEOMAMA_CHECKPOINTS`, `VIDEOMAMA_BASE_MODEL_PATH`,
-`VIDEOMAMA_UNET_CHECKPOINT_PATH`, and `SAM2_CHECKPOINT_PATH` from the
-environment, so you can redirect them without editing code.
+and `VIDEOMAMA_UNET_CHECKPOINT_PATH` from the environment, so you can redirect
+them without editing code. SAM 3 checkpoints are resolved by the upstream SAM 3
+package/Hugging Face access flow, so authenticate with `hf auth login` before
+first SAM 3 use if the checkpoint is gated.
 
 ## EXR Input Support
 

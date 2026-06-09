@@ -9,7 +9,7 @@
 # Usage:
 #   bash scripts/bootstrap_tmp_venv.sh              # both venvs
 #   bash scripts/bootstrap_tmp_venv.sh inference    # inference venv only
-#   bash scripts/bootstrap_tmp_venv.sh sam2-ui      # UI venv only
+#   bash scripts/bootstrap_tmp_venv.sh sam3-ui      # UI venv only
 #
 # After it finishes, source the generated env file:
 #   source "$REPO_ROOT/.videomama-env"
@@ -23,11 +23,12 @@ DEFAULT_CHECKPOINTS="/mnt/production/project/bcn_lib/work/AI/VideoMaMa/checkpoin
 CHECKPOINTS_DIR="${VIDEOMAMA_CHECKPOINTS:-${DEFAULT_CHECKPOINTS}}"
 
 INFER_VENV="${VIDEOMAMA_VENV:-/tmp/videomama-venv}"
-UI_VENV="${VIDEOMAMA_UI_VENV:-/tmp/videomama-sam2-ui-venv}"
+UI_VENV="${VIDEOMAMA_UI_VENV:-/tmp/videomama-sam3-ui-venv}"
 
-TORCH_INDEX_URL="${TORCH_INDEX_URL:-https://download.pytorch.org/whl/cu124}"
+INFER_TORCH_INDEX_URL="${INFER_TORCH_INDEX_URL:-https://download.pytorch.org/whl/cu124}"
+UI_TORCH_INDEX_URL="${UI_TORCH_INDEX_URL:-https://download.pytorch.org/whl/cu128}"
 PYTHON_INFER_BIN="${PYTHON_INFER_BIN:-python3.9}"
-PYTHON_UI_BIN="${PYTHON_UI_BIN:-python3.10}"
+PYTHON_UI_BIN="${PYTHON_UI_BIN:-python3.12}"
 
 target="${1:-all}"
 
@@ -52,7 +53,7 @@ build_inference_venv() {
   # shellcheck disable=SC1091
   source "${INFER_VENV}/bin/activate"
   python -m pip install --upgrade pip setuptools wheel
-  python -m pip install --index-url "${TORCH_INDEX_URL}" \
+  python -m pip install --index-url "${INFER_TORCH_INDEX_URL}" \
       torch==2.4.0 torchvision==0.19.0 torchaudio==2.4.0
   python -m pip install -r "${REPO_ROOT}/scripts/requirements-inference.txt"
   deactivate
@@ -60,7 +61,7 @@ build_inference_venv() {
 }
 
 build_ui_venv() {
-  log "Building SAM2 UI venv at ${UI_VENV} (Python: ${PYTHON_UI_BIN})"
+  log "Building SAM 3 UI venv at ${UI_VENV} (Python: ${PYTHON_UI_BIN})"
   check_python "${PYTHON_UI_BIN}" "ui"
 
   if [[ ! -d "${UI_VENV}" ]]; then
@@ -69,11 +70,11 @@ build_ui_venv() {
   # shellcheck disable=SC1091
   source "${UI_VENV}/bin/activate"
   python -m pip install --upgrade pip setuptools wheel
-  python -m pip install --index-url "${TORCH_INDEX_URL}" \
-      torch==2.4.0 torchvision==0.19.0 torchaudio==2.4.0
-  python -m pip install -r "${REPO_ROOT}/scripts/requirements-sam2-ui.txt"
+  python -m pip install --index-url "${UI_TORCH_INDEX_URL}" \
+      torch==2.10.0 torchvision torchaudio
+  python -m pip install -r "${REPO_ROOT}/scripts/requirements-sam3-ui.txt"
   deactivate
-  log "SAM2 UI venv ready."
+  log "SAM 3 UI venv ready."
 }
 
 write_env_file() {
@@ -84,7 +85,6 @@ export VIDEOMAMA_ROOT="${REPO_ROOT}"
 export VIDEOMAMA_CHECKPOINTS="${CHECKPOINTS_DIR}"
 export VIDEOMAMA_VENV="${INFER_VENV}"
 export VIDEOMAMA_UI_VENV="${UI_VENV}"
-export SAM2_CHECKPOINT_PATH="\${SAM2_CHECKPOINT_PATH:-${CHECKPOINTS_DIR}/sam2.1_hiera_large.pt}"
 export VIDEOMAMA_BASE_MODEL_PATH="\${VIDEOMAMA_BASE_MODEL_PATH:-${CHECKPOINTS_DIR}/stable-video-diffusion-img2vid-xt}"
 export VIDEOMAMA_UNET_CHECKPOINT_PATH="\${VIDEOMAMA_UNET_CHECKPOINT_PATH:-${CHECKPOINTS_DIR}/VideoMaMa}"
 EOF
@@ -103,11 +103,11 @@ case "${target}" in
   inference)
     build_inference_venv
     ;;
-  sam2-ui)
+  sam3-ui)
     build_ui_venv
     ;;
   *)
-    echo "Unknown target: ${target} (expected: all | inference | sam2-ui)" >&2
+    echo "Unknown target: ${target} (expected: all | inference | sam3-ui)" >&2
     exit 2
     ;;
 esac
@@ -122,7 +122,7 @@ Activate inference env:
     source "${ENV_FILE}"
     source "\${VIDEOMAMA_VENV}/bin/activate"
 
-Launch SAM2 production UI:
+Launch SAM 3 production UI:
     bash "${REPO_ROOT}/scripts/run_production_frame_ui.sh"
 
 Checkpoints: ${CHECKPOINTS_DIR}

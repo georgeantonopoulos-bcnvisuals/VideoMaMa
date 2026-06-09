@@ -1,0 +1,16 @@
+# SAM 3 production frame UI environment (Python 3.12+).
+# Torch must come from the CUDA index; installed separately by bootstrap.
+diffusers>=0.31.0
+transformers>=4.57.0
+accelerate>=1.9.0
+einops>=0.8.0
+opencv-python-headless>=4.10.0
+Pillow>=10.0.0
+numpy
+OpenEXR
+Imath
+imageio
+imageio-ffmpeg
+gradio==4.44.1
+pydantic==2.10.6
+git+https://github.com/facebookresearch/sam3.git

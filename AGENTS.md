@@ -2,14 +2,14 @@
 
 ## Project Overview
 
-This repository is a working fork of VideoMaMa, "Mask-Guided Video Matting via Generative Prior." It contains the upstream training and inference code plus a custom production UI/harness that combines SAM2 mask tracking with VideoMaMa matting over image or EXR sequences.
+This repository is a working fork of VideoMaMa, "Mask-Guided Video Matting via Generative Prior." It contains the upstream training and inference code plus a custom production UI/harness that combines SAM 3 mask tracking with VideoMaMa matting over image or EXR sequences.
 
 Core pieces:
 
 - `pipeline_svd_mask.py`: VideoMaMa inference pipeline built around Stable Video Diffusion with mask conditioning.
 - `inference_onestep_folder.py`: batch folder inference entry point for pre-existing image and mask sequence folders.
-- `demo/production_frame_app.py`: custom Gradio production UI for loading a sequence, adding SAM2 keyframe prompts, generating masks, and running VideoMaMa over the shot.
-- `demo/sam2_wrapper_hf.py`: production SAM2 wrapper used by `production_frame_app.py`; supports multi-keyframe prompting and forward/reverse propagation.
+- `demo/production_frame_app.py`: custom Gradio production UI for loading a sequence, adding SAM 3 keyframe prompts, generating masks, and running VideoMaMa over the shot.
+- `demo/sam3_wrapper_hf.py`: production SAM 3 wrapper used by `production_frame_app.py`; supports multi-keyframe prompting and propagation.
 - `demo/videomama_wrapper.py`: VideoMaMa wrapper used by the production app.
 - `scripts/bootstrap_tmp_venv.sh`: builds local runtime venvs in `/tmp` and writes `.videomama-env`.
 - `scripts/run_production_frame_ui.sh`: launches the production Gradio UI.
@@ -21,9 +21,9 @@ Production machines keep code, weights, and venvs separate:
 - Code/config: this repo, usually `/mnt/production/user/<username>/DEV/AI/VideoMama/`.
 - Shared checkpoints: `/mnt/production/project/bcn_lib/work/AI/VideoMaMa/checkpoints/`.
 - Inference venv: `/tmp/videomama-venv/` using Python 3.9.
-- SAM2 UI venv: `/tmp/videomama-sam2-ui-venv/` using Python 3.10.
+- SAM 3 UI venv: `/tmp/videomama-sam3-ui-venv/` using Python 3.12.
 
-The upstream `sam2` package does not support Python 3.9, so the UI and base inference environments are intentionally split.
+SAM 3 requires a newer Python/PyTorch/CUDA stack than the base VideoMaMa inference environment, so the UI and base inference environments are intentionally split.
 
 Important environment variables are written to `.videomama-env`:
 
@@ -31,7 +31,6 @@ Important environment variables are written to `.videomama-env`:
 - `VIDEOMAMA_CHECKPOINTS`
 - `VIDEOMAMA_VENV`
 - `VIDEOMAMA_UI_VENV`
-- `SAM2_CHECKPOINT_PATH`
 - `VIDEOMAMA_BASE_MODEL_PATH`
 - `VIDEOMAMA_UNET_CHECKPOINT_PATH`
 
@@ -50,10 +49,10 @@ Bootstrap only one environment:
 
 ```bash
 bash scripts/bootstrap_tmp_venv.sh inference
-bash scripts/bootstrap_tmp_venv.sh sam2-ui
+bash scripts/bootstrap_tmp_venv.sh sam3-ui
 ```
 
-Launch the production SAM2 + VideoMaMa UI:
+Launch the production SAM 3 + VideoMaMa UI:
 
 ```bash
 bash scripts/run_production_frame_ui.sh
@@ -76,11 +75,11 @@ VIDEOMAMA_UI_PORT=7862 VIDEOMAMA_UI_SHARE=0 bash scripts/run_production_frame_ui
 `demo/production_frame_app.py` does the following:
 
 1. Loads an image or EXR sequence from a directory.
-2. Converts frames to RGB and caches resized 1024x576 JPEGs under `tmp/production_sequence_app/<timestamp>_<sequence>/sam2_frames`.
-3. Lets the user add positive/negative SAM2 point prompts on multiple keyframes.
+2. Converts frames to RGB and caches resized 1024x576 JPEGs under `tmp/production_sequence_app/<timestamp>_<sequence>/sam3_frames`.
+3. Lets the user add positive/negative SAM 3 point prompts on multiple keyframes.
 4. Saves keyframe prompts to `keyframe_prompts.json`.
-5. Uses `sam2_wrapper_hf.SAM2VideoTracker.track_video_from_dir()` to propagate masks across the cached sequence.
-6. Saves masks under `sam2_masks`.
+5. Uses `sam3_wrapper_hf.SAM3VideoTracker.track_video_from_dir()` to propagate masks across the cached sequence.
+6. Saves masks under `sam3_masks`.
 7. Runs VideoMaMa in chunks with configurable overlap.
 8. Saves outputs under `videomama_frames` and grayscale alpha previews under `alpha_frames`.
 
@@ -112,7 +111,7 @@ The CLI supports EXR input and mask channel selection. See `inference.md` for fl
 ## Dependency Notes
 
 - `scripts/requirements-inference.txt` is the Python 3.9 inference dependency set.
-- `scripts/requirements-sam2-ui.txt` is the Python 3.10 production UI dependency set and installs SAM2 from GitHub.
+- `scripts/requirements-sam3-ui.txt` is the Python 3.12 production UI dependency set and installs SAM 3 from GitHub.
 - Torch is installed separately by `scripts/bootstrap_tmp_venv.sh` from the CUDA 12.4 wheel index.
 - `setup.py` contains the broader upstream/training dependency list and includes heavy training dependencies such as `deepspeed` and `flash_attn`.
 
@@ -129,14 +128,14 @@ Avoid mixing the UI and inference venv assumptions unless you are explicitly cha
 ## Development Guidance
 
 - The worktree may contain existing local changes; do not revert them unless explicitly asked.
-- Prefer editing only the custom production harness files when fixing SAM2 + VideoMaMa UI behavior:
+- Prefer editing only the custom production harness files when fixing SAM 3 + VideoMaMa UI behavior:
   - `demo/production_frame_app.py`
-  - `demo/sam2_wrapper_hf.py`
+  - `demo/sam3_wrapper_hf.py`
   - `demo/videomama_wrapper.py`
   - `scripts/bootstrap_tmp_venv.sh`
   - `scripts/run_production_frame_ui.sh`
   - `scripts/requirements-*.txt`
-- Be careful with `demo/sam2_wrapper.py`: it is the older wrapper and contains a hardcoded external SAM2 path. The production app imports `sam2_wrapper_hf.py`.
+- Be careful with `demo/sam2_wrapper.py` and `demo/sam2_wrapper_hf.py`: these are older SAM2 wrappers. The production app imports `sam3_wrapper_hf.py`.
 - Generated app outputs belong under `tmp/production_sequence_app/` and should not be treated as source.
 - Checkpoint directories can be very large; do not vendor weights into the repo.
 - Preserve the 1024x576 working size unless you also audit VideoMaMa assumptions in the wrappers and pipeline.
@@ -146,14 +145,14 @@ Avoid mixing the UI and inference venv assumptions unless you are explicitly cha
 Basic import/syntax checks without starting a GPU workload:
 
 ```bash
-python -m py_compile demo/production_frame_app.py demo/sam2_wrapper_hf.py demo/videomama_wrapper.py
+python -m py_compile demo/production_frame_app.py demo/sam3_wrapper_hf.py demo/videomama_wrapper.py
 ```
 
 Check environment wiring:
 
 ```bash
 source .videomama-env
-printf '%s\n' "$VIDEOMAMA_CHECKPOINTS" "$SAM2_CHECKPOINT_PATH" "$VIDEOMAMA_BASE_MODEL_PATH" "$VIDEOMAMA_UNET_CHECKPOINT_PATH"
+printf '%s\n' "$VIDEOMAMA_CHECKPOINTS" "$VIDEOMAMA_BASE_MODEL_PATH" "$VIDEOMAMA_UNET_CHECKPOINT_PATH"
 ```
 
 Starting the UI or running inference can require GPU access and large checkpoints. Do not assume those are available in every coding session.

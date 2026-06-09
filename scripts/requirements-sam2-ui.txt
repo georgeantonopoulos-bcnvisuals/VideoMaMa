@@ -1,18 +1,2 @@
-# SAM2 production frame UI environment (Python 3.10+).
-# Torch must come from the CUDA index; installed separately by bootstrap.
-torch>=2.4.0
-torchvision>=0.19.0
-diffusers>=0.31.0
-transformers>=4.57.0
-accelerate>=1.9.0
-einops>=0.8.0
-opencv-python-headless>=4.10.0
-Pillow>=10.0.0
-numpy<2
-OpenEXR
-Imath
-imageio
-imageio-ffmpeg
-gradio==4.44.1
-pydantic==2.10.6
-git+https://github.com/facebookresearch/sam2.git
+# Deprecated: the production UI now uses SAM 3.
+# Use scripts/requirements-sam3-ui.txt and bootstrap target `sam3-ui`.
