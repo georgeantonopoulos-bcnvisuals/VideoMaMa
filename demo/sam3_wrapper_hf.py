@@ -15,8 +15,40 @@ import numpy as np
 from PIL import Image
 
 
+def _assert_hf_sam3_access(repo_id: str):
+    try:
+        from huggingface_hub import hf_hub_download
+        from huggingface_hub.errors import GatedRepoError, HfHubHTTPError, LocalEntryNotFoundError
+    except ImportError as exc:
+        raise RuntimeError(
+            "huggingface_hub is required for SAM 3 checkpoint access. Refresh the SAM 3 UI environment."
+        ) from exc
+
+    try:
+        hf_hub_download(repo_id=repo_id, filename="config.json")
+    except GatedRepoError as exc:
+        raise RuntimeError(
+            f"SAM 3 checkpoint repo `{repo_id}` is gated. Request access at "
+            f"https://huggingface.co/{repo_id}, then authenticate this machine with "
+            "`/tmp/videomama-sam3-ui-venv/bin/hf auth login`."
+        ) from exc
+    except HfHubHTTPError as exc:
+        status_code = getattr(getattr(exc, "response", None), "status_code", None)
+        if status_code in {401, 403}:
+            raise RuntimeError(
+                f"SAM 3 checkpoint repo `{repo_id}` requires Hugging Face authentication. "
+                "Run `/tmp/videomama-sam3-ui-venv/bin/hf auth login` with a token that has access."
+            ) from exc
+        raise
+    except LocalEntryNotFoundError as exc:
+        raise RuntimeError(
+            f"Could not reach or cache SAM 3 checkpoint repo `{repo_id}`. Check network access to "
+            "huggingface.co and authenticate with `/tmp/videomama-sam3-ui-venv/bin/hf auth login`."
+        ) from exc
+
+
 class SAM3VideoTracker:
-    def __init__(self, device="cuda", gpus_to_use: Optional[List[int]] = None):
+    def __init__(self, device="cuda", gpus_to_use: Optional[List[int]] = None, model_version="sam3"):
         try:
             from sam3.model_builder import build_sam3_video_predictor
         except ModuleNotFoundError as exc:
@@ -49,9 +81,13 @@ class SAM3VideoTracker:
         if gpus_to_use is None:
             gpus_to_use = [torch.cuda.current_device()]
 
+        repo_id = "facebook/sam3.1" if model_version == "sam3.1" else "facebook/sam3"
+        _assert_hf_sam3_access(repo_id)
+
         kwargs = {}
         if gpus_to_use is not None:
             kwargs["gpus_to_use"] = gpus_to_use
+        kwargs["version"] = model_version
         self.predictor = build_sam3_video_predictor(**kwargs)
         print(f"SAM 3 video predictor initialized on {device}")
 
@@ -202,5 +238,5 @@ class SAM3VideoTracker:
         return self.get_frame_mask(frame, points, labels)
 
 
-def load_sam3_tracker(device="cuda"):
-    return SAM3VideoTracker(device=device)
+def load_sam3_tracker(device="cuda", model_version="sam3"):
+    return SAM3VideoTracker(device=device, model_version=model_version)

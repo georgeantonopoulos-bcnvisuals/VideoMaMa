@@ -148,6 +148,16 @@ them without editing code. SAM 3 checkpoints are resolved by the upstream SAM 3
 package/Hugging Face access flow, so authenticate with `hf auth login` before
 first SAM 3 use if the checkpoint is gated.
 
+SAM 3 model initialization downloads gated checkpoints from Hugging Face. Before
+clicking `Initialize Models`, request access to `facebook/sam3`, then run:
+
+```bash
+/tmp/videomama-sam3-ui-venv/bin/hf auth login
+```
+
+Use `SAM3_MODEL_VERSION=sam3.1` at launch if you have access to the newer
+`facebook/sam3.1` checkpoint instead.
+
 ## EXR Input Support
 
 `inference_onestep_folder.py` can read `.exr` frames directly for both image and mask sequences.

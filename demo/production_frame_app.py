@@ -131,9 +131,10 @@ def initialize_models():
     import torch
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    sam3_tracker = load_sam3_tracker(device=device)
+    sam3_version = os.environ.get("SAM3_MODEL_VERSION", "sam3")
+    sam3_tracker = load_sam3_tracker(device=device, model_version=sam3_version)
     videomama_pipeline = load_videomama_pipeline(device=device)
-    return f"Loaded SAM 3 and VideoMaMa on {device}."
+    return f"Loaded SAM 3 ({sam3_version}) and VideoMaMa on {device}."
 
 
 def _keyframe_summary(state):

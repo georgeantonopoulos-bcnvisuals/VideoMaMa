@@ -35,6 +35,7 @@ fi
 export VIDEOMAMA_UI_HOST="${VIDEOMAMA_UI_HOST:-127.0.0.1}"
 export VIDEOMAMA_UI_PORT="${VIDEOMAMA_UI_PORT:-7861}"
 export VIDEOMAMA_UI_SHARE="${VIDEOMAMA_UI_SHARE:-1}"
+export SAM3_MODEL_VERSION="${SAM3_MODEL_VERSION:-sam3}"
 
 # shellcheck disable=SC1091
 source "${UI_VENV}/bin/activate"

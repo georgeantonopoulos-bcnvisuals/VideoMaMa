@@ -57,6 +57,11 @@ pyenv-installed 3.12 under `~/.pyenv`. Override with `PYTHON_UI_BIN=/path/to/pyt
 when needed. The launch script activates the built UI venv; it does not create
 the venv itself.
 
+SAM 3 checkpoints are gated on Hugging Face. The UI venv must be authenticated
+with `/tmp/videomama-sam3-ui-venv/bin/hf auth login`, and the token must have
+accepted access to `facebook/sam3` or `facebook/sam3.1`. Override the default
+with `SAM3_MODEL_VERSION=sam3.1` when launching.
+
 Launch the production SAM 3 + VideoMaMa UI:
 
 ```bash
