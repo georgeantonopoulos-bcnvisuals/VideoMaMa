@@ -38,4 +38,10 @@ export VIDEOMAMA_UI_SHARE="${VIDEOMAMA_UI_SHARE:-1}"
 
 # shellcheck disable=SC1091
 source "${UI_VENV}/bin/activate"
+if ! python -c "import gradio" >/dev/null 2>&1; then
+  echo "SAM 3 UI environment is missing compatible Gradio dependencies." >&2
+  echo "Refresh it with:" >&2
+  echo "  ${UI_VENV}/bin/python -m pip install -r ${REPO_ROOT}/scripts/requirements-sam3-ui.txt" >&2
+  exit 1
+fi
 exec python "${APP_PATH}"
