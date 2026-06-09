@@ -50,7 +50,7 @@ def _assert_hf_sam3_access(repo_id: str):
 class SAM3VideoTracker:
     def __init__(self, device="cuda", gpus_to_use: Optional[List[int]] = None, model_version="sam3"):
         try:
-            from sam3.model_builder import build_sam3_video_predictor
+            from sam3.model_builder import build_sam3_predictor
         except ModuleNotFoundError as exc:
             missing_module = exc.name or "unknown"
             if missing_module == "sam3":
@@ -88,7 +88,7 @@ class SAM3VideoTracker:
         if gpus_to_use is not None:
             kwargs["gpus_to_use"] = gpus_to_use
         kwargs["version"] = model_version
-        self.predictor = build_sam3_video_predictor(**kwargs)
+        self.predictor = build_sam3_predictor(**kwargs)
         print(f"SAM 3 video predictor initialized on {device}")
 
     def _normalize_prompts_by_frame(self, prompts_by_frame: Dict[int, Dict[str, List[List[int]]]]):
