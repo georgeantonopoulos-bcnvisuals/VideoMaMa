@@ -74,12 +74,22 @@ def load_videomama_pipeline(base_model_path=None, unet_checkpoint_path=None, dev
     Returns:
         VideoInferencePipeline instance
     """
-    # Use provided paths or defaults
+    # Use provided paths, env overrides, or default production mount
+    checkpoints_root = os.environ.get(
+        "VIDEOMAMA_CHECKPOINTS",
+        "/mnt/production/project/bcn_lib/work/AI/VideoMaMa/checkpoints",
+    )
     if base_model_path is None:
-        base_model_path = "checkpoints/stable-video-diffusion-img2vid-xt"
-    
+        base_model_path = os.environ.get(
+            "VIDEOMAMA_BASE_MODEL_PATH",
+            os.path.join(checkpoints_root, "stable-video-diffusion-img2vid-xt"),
+        )
+
     if unet_checkpoint_path is None:
-        unet_checkpoint_path = "checkpoints/videomama"
+        unet_checkpoint_path = os.environ.get(
+            "VIDEOMAMA_UNET_CHECKPOINT_PATH",
+            os.path.join(checkpoints_root, "VideoMaMa"),
+        )
     
     # Check if paths exist
     if not os.path.exists(base_model_path):

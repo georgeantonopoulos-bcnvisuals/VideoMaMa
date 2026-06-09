@@ -89,6 +89,53 @@ source .venv/bin/activate
 
 This creates `.venv`, installs inference-only Python dependencies, and downloads both required Hugging Face checkpoints into `checkpoints/` without Git LFS.
 
+## Shared-Weights Layout (BCN production machines)
+
+The BCN production Rocky boxes keep code, weights, and venvs on different
+filesystems so the NFS mount holds the heavy shared artefacts and each machine
+rebuilds its venvs locally on `/tmp`:
+
+| Layer                        | Path                                                                |
+|------------------------------|---------------------------------------------------------------------|
+| Weights                      | `/mnt/production/project/bcn_lib/work/AI/VideoMaMa/checkpoints/`    |
+| Code/config                  | `/mnt/production/user/<username>/DEV/AI/VideoMama/`                 |
+| Inference venv (Python 3.9)  | `/tmp/videomama-venv/`                                              |
+| SAM2 UI venv (Python 3.10)   | `/tmp/videomama-sam2-ui-venv/`                                      |
+
+### Bootstrap on any similar machine
+
+```bash
+cd /mnt/production/user/<username>/DEV/AI/VideoMama
+bash scripts/bootstrap_tmp_venv.sh        # builds both venvs on /tmp
+source .videomama-env                     # exports VIDEOMAMA_CHECKPOINTS etc.
+source "$VIDEOMAMA_VENV/bin/activate"     # inference venv
+```
+
+Launch the production SAM2 UI:
+
+```bash
+bash scripts/run_production_frame_ui.sh
+```
+
+Override any path at call time:
+
+```bash
+VIDEOMAMA_CHECKPOINTS=/some/other/path bash scripts/bootstrap_tmp_venv.sh
+```
+
+### Requirements
+
+* Python 3.9 for the inference venv, Python 3.10 for the SAM2 UI (the upstream
+  `sam2` package does not support 3.9). `pyenv` is a convenient way to provide
+  both.
+* CUDA 12.4 capable GPU driver (matches the pinned torch 2.4.0 wheels).
+* Read access to `/mnt/production/project/bcn_lib/work/AI/VideoMaMa/` and
+  write access to `/tmp`.
+
+The CLI entry points read `VIDEOMAMA_CHECKPOINTS`, `VIDEOMAMA_BASE_MODEL_PATH`,
+`VIDEOMAMA_UNET_CHECKPOINT_PATH`, and `SAM2_CHECKPOINT_PATH` from the
+environment, so you can redirect them without editing code.
+
 ## EXR Input Support
 
 `inference_onestep_folder.py` can read `.exr` frames directly for both image and mask sequences.

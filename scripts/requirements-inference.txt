@@ -1,0 +1,22 @@
+# VideoMaMa inference environment (Python 3.9+).
+# Torch pulled from PyTorch CUDA 12.4 index; installed separately by bootstrap.
+torch==2.4.0
+torchvision==0.19.0
+torchaudio==2.4.0
+accelerate==1.9.0
+diffusers==0.31.0
+transformers==4.57.0
+tokenizers==0.22.1
+numpy<2
+opencv-python-headless==4.10.0.84
+pillow
+tqdm
+scipy
+einops
+safetensors
+imageio
+imageio-ffmpeg
+huggingface_hub
+psutil
+OpenEXR
+Imath

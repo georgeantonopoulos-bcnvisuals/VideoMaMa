@@ -334,8 +334,18 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Batch inference script using the VideoInferencePipeline.")
 
     # --- Paths ---
+    _default_base_model_path = os.environ.get(
+        "VIDEOMAMA_BASE_MODEL_PATH",
+        os.path.join(
+            os.environ.get(
+                "VIDEOMAMA_CHECKPOINTS",
+                "/mnt/production/project/bcn_lib/work/AI/VideoMaMa/checkpoints",
+            ),
+            "stable-video-diffusion-img2vid-xt",
+        ),
+    )
     parser.add_argument("--base_model_path", type=str,
-                        default="checkpoints/stabilityai/stable-video-diffusion-img2vid-xt",
+                        default=_default_base_model_path,
                         help="Path to the base SVD model directory.")
     parser.add_argument("--unet_checkpoint_path", type=str, required=True,
                         help="Path to the fine-tuned UNet checkpoint.")

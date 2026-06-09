@@ -3,6 +3,7 @@ SAM2 Wrapper for Video Mask Tracking
 Handles mask generation and propagation through video
 """
 
+import os
 import sys
 sys.path.append("/home/cvlab19/project/samuel/CVPR/sam2")
 
@@ -163,7 +164,14 @@ def load_sam2_tracker(device="cuda"):
     Returns:
         SAM2VideoTracker instance
     """
-    checkpoint_path = "checkpoints/sam2/sam2.1_hiera_large.pt"
+    checkpoints_root = os.environ.get(
+        "VIDEOMAMA_CHECKPOINTS",
+        "/mnt/production/project/bcn_lib/work/AI/VideoMaMa/checkpoints",
+    )
+    checkpoint_path = os.environ.get(
+        "SAM2_CHECKPOINT_PATH",
+        os.path.join(checkpoints_root, "sam2.1_hiera_large.pt"),
+    )
     config_file = "configs/sam2.1/sam2.1_hiera_l.yaml"
     
     print(f"Loading SAM2 from {checkpoint_path}...")

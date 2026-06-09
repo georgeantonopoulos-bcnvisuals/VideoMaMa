@@ -1,3 +1,5 @@
+# SAM2 production frame UI environment (Python 3.10+).
+# Torch must come from the CUDA index; installed separately by bootstrap.
 torch>=2.4.0
 torchvision>=0.19.0
 diffusers>=0.31.0

@@ -131,7 +131,14 @@ def initialize_models():
     import torch
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    sam2_ckpt = os.environ.get("SAM2_CHECKPOINT_PATH", "checkpoints/sam2.1_hiera_large.pt")
+    checkpoints_root = os.environ.get(
+        "VIDEOMAMA_CHECKPOINTS",
+        "/mnt/production/project/bcn_lib/work/AI/VideoMaMa/checkpoints",
+    )
+    sam2_ckpt = os.environ.get(
+        "SAM2_CHECKPOINT_PATH",
+        os.path.join(checkpoints_root, "sam2.1_hiera_large.pt"),
+    )
 
     sam2_tracker = load_sam2_tracker(checkpoint_path=sam2_ckpt, device=device)
     videomama_pipeline = load_videomama_pipeline(device=device)

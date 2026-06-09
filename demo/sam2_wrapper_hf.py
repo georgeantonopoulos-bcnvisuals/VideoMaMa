@@ -205,7 +205,14 @@ class SAM2VideoTracker:
 
 def load_sam2_tracker(checkpoint_path=None, device="cuda"):
     if checkpoint_path is None:
-        checkpoint_path = 'checkpoints/sam2.1_hiera_large.pt'
+        checkpoints_root = os.environ.get(
+            "VIDEOMAMA_CHECKPOINTS",
+            "/mnt/production/project/bcn_lib/work/AI/VideoMaMa/checkpoints",
+        )
+        checkpoint_path = os.environ.get(
+            "SAM2_CHECKPOINT_PATH",
+            os.path.join(checkpoints_root, "sam2.1_hiera_large.pt"),
+        )
 
     config_file = 'configs/sam2.1/sam2.1_hiera_l.yaml'
     if not os.path.exists(config_file):

@@ -3,6 +3,7 @@ VideoMaMa Inference Wrapper
 Handles video matting with mask conditioning
 """
 
+import os
 import sys
 sys.path.append("../")
 sys.path.append("../../")
@@ -70,9 +71,18 @@ def load_videomama_pipeline(device="cuda"):
     Returns:
         VideoInferencePipeline instance
     """
-    # Local paths for testing
-    base_model_path = "checkpoints/stable-video-diffusion-img2vid-xt"
-    unet_checkpoint_path = "checkpoints/VideoMaMa"
+    checkpoints_root = os.environ.get(
+        "VIDEOMAMA_CHECKPOINTS",
+        "/mnt/production/project/bcn_lib/work/AI/VideoMaMa/checkpoints",
+    )
+    base_model_path = os.environ.get(
+        "VIDEOMAMA_BASE_MODEL_PATH",
+        os.path.join(checkpoints_root, "stable-video-diffusion-img2vid-xt"),
+    )
+    unet_checkpoint_path = os.environ.get(
+        "VIDEOMAMA_UNET_CHECKPOINT_PATH",
+        os.path.join(checkpoints_root, "VideoMaMa"),
+    )
     
     print(f"Loading VideoMaMa pipeline from {unet_checkpoint_path}...")
     
