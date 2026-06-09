@@ -1,6 +1,7 @@
 # SAM 3 production frame UI environment (Python 3.12+).
 # Torch must come from the CUDA index; installed separately by bootstrap.
-setuptools
+# SAM 3 currently imports pkg_resources, which was removed from setuptools 82+.
+setuptools<82
 diffusers>=0.31.0
 transformers>=4.57.0
 accelerate>=1.9.0
