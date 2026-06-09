@@ -152,6 +152,17 @@ class SAM3VideoTracker:
         )
         return response["session_id"]
 
+    def _close_session(self, session_id: str):
+        try:
+            self.predictor.handle_request(
+                request={
+                    "type": "close_session",
+                    "session_id": session_id,
+                }
+            )
+        except Exception as exc:
+            print(f"Warning: failed to close SAM 3 session {session_id}: {exc}")
+
     def _add_prompt(self, session_id: str, frame_idx: int, prompt_data, width: int, height: int, obj_id: int):
         import torch
 
@@ -195,15 +206,7 @@ class SAM3VideoTracker:
                 frame_idx = int(response["frame_index"])
                 final_masks[frame_idx] = self._extract_mask(response.get("outputs", {}), (height, width), obj_id=obj_id)
         finally:
-            try:
-                self.predictor.handle_request(
-                    request={
-                        "type": "close_session",
-                        "session_id": session_id,
-                    }
-                )
-            except Exception as exc:
-                print(f"Warning: failed to close SAM 3 session {session_id}: {exc}")
+            self._close_session(session_id)
 
         print(f"Generated {len(final_masks)} SAM 3 masks from {len(keyframes)} keyframes")
         return final_masks
@@ -227,12 +230,27 @@ class SAM3VideoTracker:
         )
 
     def get_frame_mask(self, frame: np.ndarray, points: List[List[int]], labels: List[int]) -> np.ndarray:
-        masks = self.track_video_with_keyframes(
-            [frame],
-            {0: {"points": points, "labels": labels}},
-            obj_id=1,
-        )
-        return masks[0]
+        height, width = frame.shape[:2]
+        temp_dir = Path(tempfile.mkdtemp())
+        frames_dir = temp_dir / "frames"
+        frames_dir.mkdir(exist_ok=True)
+        try:
+            Image.fromarray(frame).save(frames_dir / "00000.jpg", quality=95)
+            session_id = self._start_session(str(frames_dir))
+            try:
+                response = self._add_prompt(
+                    session_id,
+                    0,
+                    {"points": points, "labels": labels},
+                    width,
+                    height,
+                    obj_id=1,
+                )
+                return self._extract_mask(response.get("outputs", {}), (height, width), obj_id=1)
+            finally:
+                self._close_session(session_id)
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
 
     def get_first_frame_mask(self, frame: np.ndarray, points: List[List[int]], labels: List[int]) -> np.ndarray:
         return self.get_frame_mask(frame, points, labels)
