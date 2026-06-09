@@ -63,13 +63,13 @@ resolve_ui_python() {
     return 0
   fi
 
-  if command -v python3.12 >/dev/null 2>&1; then
-    command -v python3.12
+  if resolved="$(resolve_pyenv_python "3.12")"; then
+    printf '%s\n' "${resolved}"
     return 0
   fi
 
-  if resolved="$(resolve_pyenv_python "3.12")"; then
-    printf '%s\n' "${resolved}"
+  if command -v python3.12 >/dev/null 2>&1; then
+    command -v python3.12
     return 0
   fi
 
