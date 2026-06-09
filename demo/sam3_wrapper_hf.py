@@ -38,14 +38,16 @@ class SAM3VideoTracker:
             ) from exc
 
         self.device = device
-        if gpus_to_use is None:
-            try:
-                import torch
+        try:
+            import torch
+        except ImportError as exc:
+            raise RuntimeError("SAM 3 requires PyTorch in the production UI environment.") from exc
 
-                if device == "cuda" and torch.cuda.is_available():
-                    gpus_to_use = [torch.cuda.current_device()]
-            except ImportError:
-                gpus_to_use = None
+        if not torch.cuda.is_available():
+            raise RuntimeError("SAM 3 video prediction requires a CUDA GPU; none is visible to PyTorch.")
+
+        if gpus_to_use is None:
+            gpus_to_use = [torch.cuda.current_device()]
 
         kwargs = {}
         if gpus_to_use is not None:

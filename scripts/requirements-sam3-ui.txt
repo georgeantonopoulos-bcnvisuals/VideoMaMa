@@ -9,6 +9,7 @@ einops>=0.8.0
 opencv-python-headless>=4.10.0
 Pillow>=10.0.0
 numpy
+pycocotools
 OpenEXR
 Imath
 imageio
