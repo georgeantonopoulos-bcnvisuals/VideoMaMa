@@ -37,6 +37,24 @@ except ImportError:
     bz2.open = _missing_bz2_open
     sys.modules["bz2"] = bz2
 
+# Gradio resolves some cache/temp paths relative to the process working directory
+# and calls os.getcwd() on them per request (e.g. get_cache_folder() ->
+# abspath("gradio_cached_examples")). This repo lives on a network mount whose
+# working directory can be swapped out mid-session; getcwd() then raises
+# FileNotFoundError and Gradio's file routes 500. Pin these to absolute local
+# paths before importing gradio so resolution never depends on the cwd.
+import tempfile as _tempfile
+
+_GRADIO_TMP = Path(os.environ.setdefault(
+    "GRADIO_TEMP_DIR", str(Path(_tempfile.gettempdir()) / "videomama-gradio")
+))
+os.environ.setdefault("GRADIO_EXAMPLES_CACHE", str(_GRADIO_TMP / "examples"))
+try:
+    _GRADIO_TMP.mkdir(parents=True, exist_ok=True)
+    Path(os.environ["GRADIO_EXAMPLES_CACHE"]).mkdir(parents=True, exist_ok=True)
+except OSError:
+    pass
+
 import gradio as gr
 import numpy as np
 from PIL import Image
@@ -65,8 +83,71 @@ POINT_ALPHA = 0.9
 POINT_RADIUS = 15
 SUPPORTED_IMAGE_EXTS = {".exr", ".png", ".jpg", ".jpeg", ".tif", ".tiff"}
 
+# Anchor the app's working area to the repo (not the launch CWD) so settings and
+# prior runs are found reliably and outputs land where AGENTS.md documents them.
+APP_TMP_ROOT = REPO_ROOT / 'tmp' / 'production_sequence_app'
+SETTINGS_PATH = APP_TMP_ROOT / 'ui_settings.json'
+
+DEFAULT_SETTINGS = {
+    'sequence_dir': DEFAULT_SEQUENCE_DIR,
+    'exr_gamma': DEFAULT_EXR_GAMMA,
+    'point_mode': 'Positive',
+    'chunk_size': 16,
+    'overlap': 4,
+    'resume_from_tmp': True,
+    'range_start': 0,
+    'range_end': -1,
+}
+
 sam3_tracker = None
 videomama_pipeline = None
+
+
+def _load_ui_settings():
+    """Load persisted UI settings, falling back to defaults for missing keys."""
+    settings = dict(DEFAULT_SETTINGS)
+    try:
+        with SETTINGS_PATH.open('r', encoding='utf-8') as f:
+            saved = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return settings
+    if isinstance(saved, dict):
+        for key in DEFAULT_SETTINGS:
+            if saved.get(key) is not None:
+                settings[key] = saved[key]
+    return settings
+
+
+def _save_ui_settings(sequence_dir, exr_gamma, point_mode, chunk_size, overlap, resume_from_tmp,
+                      range_start, range_end):
+    """Persist the current input panel so the next launch restores it."""
+    APP_TMP_ROOT.mkdir(parents=True, exist_ok=True)
+    payload = {
+        'sequence_dir': str(sequence_dir),
+        'exr_gamma': float(exr_gamma),
+        'point_mode': str(point_mode),
+        'chunk_size': int(chunk_size),
+        'overlap': int(overlap),
+        'resume_from_tmp': bool(resume_from_tmp),
+        'range_start': int(range_start),
+        'range_end': int(range_end),
+    }
+    try:
+        with SETTINGS_PATH.open('w', encoding='utf-8') as f:
+            json.dump(payload, f, indent=2)
+    except OSError as exc:
+        print(f"Warning: could not save UI settings: {exc}")
+
+
+def _free_cuda_cache():
+    """Return cached-but-unused CUDA blocks to the driver. Safe no-op on CPU."""
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
 
 
 def _read_exr_rgb(image_path: str, exr_gamma: float = DEFAULT_EXR_GAMMA, exr_exposure: float = 0.0) -> np.ndarray:
@@ -118,9 +199,87 @@ def _read_png(path: Path):
     return np.array(Image.open(path))
 
 
+def _safe_name(base_name: str):
+    return ''.join(ch if ch.isalnum() or ch in ('-', '_') else '_' for ch in base_name) or 'sequence'
+
+
 def _run_root(base_name: str):
-    safe_name = ''.join(ch if ch.isalnum() or ch in ('-', '_') else '_' for ch in base_name) or 'sequence'
-    return Path('tmp/production_sequence_app') / f"{time.strftime('%Y%m%d_%H%M%S')}_{safe_name}"
+    return APP_TMP_ROOT / f"{time.strftime('%Y%m%d_%H%M%S')}_{_safe_name(base_name)}"
+
+
+def _write_session_meta(run_root: Path, sequence_dir: str, exr_gamma: float, frame_names):
+    """Record which sequence a run belongs to so it can be matched on resume."""
+    meta = {
+        'sequence_dir': str(Path(sequence_dir).resolve()),
+        'exr_gamma': float(exr_gamma),
+        'frame_count': len(frame_names),
+        'frame_names': list(frame_names),
+    }
+    try:
+        with (Path(run_root) / 'session.json').open('w', encoding='utf-8') as f:
+            json.dump(meta, f, indent=2)
+    except OSError as exc:
+        print(f"Warning: could not write session metadata: {exc}")
+
+
+def _find_existing_run(sequence_dir: str, frame_names):
+    """Find the most recent prior run for this sequence that has data to restore."""
+    if not APP_TMP_ROOT.is_dir():
+        return None
+    resolved = str(Path(sequence_dir).resolve())
+    safe = _safe_name(Path(sequence_dir).name)
+    frame_count = len(frame_names)
+
+    run_dirs = sorted((d for d in APP_TMP_ROOT.iterdir() if d.is_dir()), key=lambda d: d.name, reverse=True)
+    for run_dir in run_dirs:
+        meta_path = run_dir / 'session.json'
+        matches = False
+        if meta_path.exists():
+            try:
+                with meta_path.open('r', encoding='utf-8') as f:
+                    meta = json.load(f)
+                matches = str(meta.get('sequence_dir')) == resolved and int(meta.get('frame_count', -1)) == frame_count
+            except (json.JSONDecodeError, OSError, ValueError, TypeError):
+                matches = False
+        elif run_dir.name.endswith('_' + safe):
+            # Older runs predate session.json; fall back to name + cached frame count.
+            cache = run_dir / 'sam3_frames'
+            matches = cache.is_dir() and len(list(cache.glob('*.jpg'))) == frame_count
+
+        if not matches:
+            continue
+
+        has_prompts = (run_dir / 'keyframe_prompts.json').exists()
+        masks_dir = run_dir / 'sam3_masks'
+        has_masks = masks_dir.is_dir() and any(masks_dir.glob('*.png'))
+        if has_prompts or has_masks:
+            return run_dir
+    return None
+
+
+def _load_prompts_from_run(run_root: Path):
+    """Restore keyframe prompts saved by a prior generate_sam3_masks run."""
+    prompts_path = Path(run_root) / 'keyframe_prompts.json'
+    if not prompts_path.exists():
+        return {}
+    try:
+        with prompts_path.open('r', encoding='utf-8') as f:
+            saved = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return {}
+    restored = {}
+    for key, value in (saved or {}).items():
+        if not isinstance(value, dict):
+            continue
+        points = value.get('points') or []
+        labels = value.get('labels') or []
+        if len(points) != len(labels):
+            continue
+        restored[str(int(key))] = {
+            'points': [[int(round(float(x))), int(round(float(y)))] for x, y in points],
+            'labels': [int(label) for label in labels],
+        }
+    return restored
 
 
 def initialize_models():
@@ -253,27 +412,51 @@ def _ui_state_payload(state, status_message):
     )
 
 
-def load_sequence(sequence_dir: str, exr_gamma: float):
+def load_sequence(sequence_dir: str, exr_gamma: float, resume_from_tmp: bool = True):
+    exr_gamma = float(exr_gamma)
     frame_paths = _discover_sequence_files(sequence_dir)
-    run_root = _run_root(Path(sequence_dir).name)
+    frame_names = [path.name for path in frame_paths]
+
+    existing_run = _find_existing_run(sequence_dir, frame_names) if resume_from_tmp else None
+    run_root = existing_run if existing_run is not None else _run_root(Path(sequence_dir).name)
     cache_dir = run_root / 'sam3_frames'
     cache_dir.mkdir(parents=True, exist_ok=True)
 
-    cache_frame_paths = []
-    original_sizes = []
-    print(f"Preparing {len(frame_paths)} frames for SAM 3/UI cache...")
-    for idx, frame_path in enumerate(frame_paths):
-        frame = _load_rgb_frame(str(frame_path), exr_gamma=exr_gamma)
-        original_sizes.append([int(frame.shape[1]), int(frame.shape[0])])
-        working_frame = _resize_rgb_frame(frame)
-        cache_path = cache_dir / f"{idx:05d}.jpg"
-        Image.fromarray(working_frame).save(cache_path, quality=95)
-        cache_frame_paths.append(str(cache_path))
+    # Reuse the cached working frames when an existing run already has a complete,
+    # gamma-matching set; otherwise (re)build the 1024x576 JPEG cache.
+    cached_jpgs = sorted(cache_dir.glob('*.jpg'))
+    cached_gamma = None
+    if existing_run is not None and (run_root / 'session.json').exists():
+        try:
+            with (run_root / 'session.json').open('r', encoding='utf-8') as f:
+                cached_gamma = float(json.load(f).get('exr_gamma'))
+        except (json.JSONDecodeError, OSError, TypeError, ValueError):
+            cached_gamma = None
+    reuse_cache = (
+        existing_run is not None
+        and len(cached_jpgs) == len(frame_paths)
+        and (cached_gamma is None or abs(cached_gamma - exr_gamma) < 1e-6)
+    )
+
+    if reuse_cache:
+        cache_frame_paths = [str(path) for path in cached_jpgs]
+        print(f"Reusing {len(cache_frame_paths)} cached frames from {cache_dir}")
+    else:
+        cache_frame_paths = []
+        print(f"Preparing {len(frame_paths)} frames for SAM 3/UI cache...")
+        for idx, frame_path in enumerate(frame_paths):
+            frame = _load_rgb_frame(str(frame_path), exr_gamma=exr_gamma)
+            working_frame = _resize_rgb_frame(frame)
+            cache_path = cache_dir / f"{idx:05d}.jpg"
+            Image.fromarray(working_frame).save(cache_path, quality=95)
+            cache_frame_paths.append(str(cache_path))
+
+    _write_session_meta(run_root, sequence_dir, exr_gamma, frame_names)
 
     state = {
         'sequence_dir': str(Path(sequence_dir).resolve()),
         'frame_paths': [str(path) for path in frame_paths],
-        'frame_names': [path.name for path in frame_paths],
+        'frame_names': frame_names,
         'cache_dir': str(cache_dir),
         'cache_frame_paths': cache_frame_paths,
         'current_frame_idx': 0,
@@ -283,9 +466,41 @@ def load_sequence(sequence_dir: str, exr_gamma: float):
         'videomama_output_dir': None,
         'alpha_output_dir': None,
         'run_root': str(run_root),
-        'exr_gamma': float(exr_gamma),
-        'original_sizes': original_sizes,
+        'exr_gamma': exr_gamma,
     }
+
+    # Restore prior points / masks / outputs from the matched run, if any.
+    restored = []
+    if existing_run is not None:
+        prompts = _load_prompts_from_run(run_root)
+        if prompts:
+            state['prompts_by_frame'] = prompts
+            restored.append(f"{len(prompts)} keyframe(s)")
+
+        masks_dir = run_root / 'sam3_masks'
+        first_stem = Path(frame_names[0]).stem
+        if masks_dir.is_dir() and (masks_dir / f"{first_stem}.png").exists():
+            state['generated_masks_dir'] = str(masks_dir)
+            restored.append('SAM 3 masks')
+
+        outputs_dir = run_root / 'videomama_frames'
+        if outputs_dir.is_dir() and (outputs_dir / f"{first_stem}.png").exists():
+            state['videomama_output_dir'] = str(outputs_dir)
+            restored.append('VideoMaMa outputs')
+        alpha_dir = run_root / 'alpha_frames'
+        if alpha_dir.is_dir() and any(alpha_dir.glob('*.png')):
+            state['alpha_output_dir'] = str(alpha_dir)
+
+    if restored:
+        status_message = (
+            f"Loaded {len(frame_paths)} frames from {sequence_dir}. "
+            f"Resumed from {run_root.name}: restored {', '.join(restored)}."
+        )
+    else:
+        status_message = (
+            f"Loaded {len(frame_paths)} frames from {sequence_dir}. "
+            "Click any frame to add keyframe prompts."
+        )
 
     preview, mask, output_preview = _render_frame_preview(state, 0)
     return (
@@ -296,9 +511,9 @@ def load_sequence(sequence_dir: str, exr_gamma: float):
         gr.update(minimum=0, maximum=len(frame_paths) - 1, value=0, step=1, interactive=True),
         _frame_info(state),
         _keyframe_summary(state),
-        '',
-        '',
-        f"Loaded {len(frame_paths)} frames from {sequence_dir}. Click any frame to add keyframe prompts.",
+        state.get('generated_masks_dir') or '',
+        state.get('videomama_output_dir') or '',
+        status_message,
     )
 
 
@@ -403,6 +618,11 @@ def generate_sam3_masks(state):
         json.dump({str(k): v for k, v in prompts.items()}, f, indent=2)
 
     masks = sam3_tracker.track_video_from_dir(state['cache_dir'], prompts)
+
+    # SAM 3 propagation leaves a large block of cached VRAM behind. Release it so
+    # the co-resident VideoMaMa matting pass has room on the same GPU.
+    _free_cuda_cache()
+
     for frame_name, mask in zip(state['frame_names'], masks):
         Image.fromarray(mask).save(mask_dir / f"{Path(frame_name).stem}.png")
 
@@ -412,7 +632,21 @@ def generate_sam3_masks(state):
     return _ui_state_payload(state, f"Generated {len(masks)} SAM 3 masks using {_keyframe_summary(state)}")
 
 
-def run_sequence(state, chunk_size, overlap):
+def _resolve_range(range_start, range_end, total_frames):
+    """Clamp a user-supplied [start, end] (inclusive) range to valid frame indices.
+
+    An end of -1 (or any value >= total) means "through the last frame", so the
+    default leaves the whole sequence selected.
+    """
+    start = max(0, min(int(range_start), total_frames - 1))
+    end = int(range_end)
+    if end < 0 or end >= total_frames:
+        end = total_frames - 1
+    end = max(end, start)
+    return start, end
+
+
+def run_sequence(state, chunk_size, overlap, range_start=0, range_end=-1):
     if state is None:
         raise gr.Error('Load a sequence first.')
     if videomama_pipeline is None:
@@ -422,6 +656,9 @@ def run_sequence(state, chunk_size, overlap):
         state = generate_sam3_masks(state)[3]
 
     total_frames = len(state['frame_paths'])
+    range_start, range_end = _resolve_range(range_start, range_end, total_frames)
+    is_subrange = not (range_start == 0 and range_end == total_frames - 1)
+
     chunk_size = max(1, int(chunk_size))
     overlap = max(0, int(overlap))
     if overlap >= chunk_size:
@@ -434,9 +671,14 @@ def run_sequence(state, chunk_size, overlap):
     output_dir.mkdir(parents=True, exist_ok=True)
     alpha_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"Running VideoMaMa over {total_frames} frames with chunk_size={chunk_size}, overlap={overlap}")
-    for start in range(0, total_frames, step):
-        end = min(total_frames, start + chunk_size)
+    processed = 0
+    print(
+        f"Running VideoMaMa over frames [{range_start}, {range_end}] "
+        f"({range_end - range_start + 1} of {total_frames}) with chunk_size={chunk_size}, overlap={overlap}"
+    )
+    # `end` is exclusive within the loop; the range is inclusive of range_end.
+    for start in range(range_start, range_end + 1, step):
+        end = min(range_end + 1, start + chunk_size)
         chunk_frame_paths = state['frame_paths'][start:end]
         chunk_frame_names = state['frame_names'][start:end]
 
@@ -449,7 +691,10 @@ def run_sequence(state, chunk_size, overlap):
             masks_np.append(np.array(Image.open(mask_path).convert('L')))
 
         output_frames = videomama(videomama_pipeline, frames_np, masks_np)
-        keep_from = 0 if start == 0 else overlap
+        # Keep every frame of the first chunk in this run; for later chunks drop the
+        # leading `overlap` frames, which the previous chunk already wrote (the
+        # overlap re-processes shared frames so segment boundaries blend cleanly).
+        keep_from = 0 if start == range_start else overlap
         for local_idx in range(keep_from, len(output_frames)):
             frame_name = chunk_frame_names[local_idx]
             output_frame = output_frames[local_idx]
@@ -457,15 +702,23 @@ def run_sequence(state, chunk_size, overlap):
             alpha_path = alpha_dir / f"{Path(frame_name).stem}.png"
             Image.fromarray(output_frame).save(output_path)
             Image.fromarray(output_frame).convert('L').save(alpha_path)
+            processed += 1
 
-        if end == total_frames:
+        # Drop this chunk's cached activations before the next chunk so peak VRAM
+        # does not creep up (and fragment) across a long sequence.
+        _free_cuda_cache()
+
+        if end == range_end + 1:
             break
 
     state['videomama_output_dir'] = str(output_dir)
     state['alpha_output_dir'] = str(alpha_dir)
+    # Jump the viewer to the start of what was just processed.
+    state['current_frame_idx'] = range_start
+    scope = f"frames [{range_start}, {range_end}]" if is_subrange else "the whole sequence"
     return _ui_state_payload(
         state,
-        f"Saved VideoMaMa sequence outputs to {output_dir} and alpha previews to {alpha_dir}",
+        f"Saved VideoMaMa outputs for {scope} ({processed} frame(s) written) to {output_dir}.",
     )
 
 
@@ -476,14 +729,24 @@ with gr.Blocks(title='VideoMaMa Production Sequence App') as demo:
 
     state = gr.State(None)
 
-    with gr.Row():
-        sequence_dir = gr.Textbox(label='Sequence Directory', value=DEFAULT_SEQUENCE_DIR)
-        exr_gamma = gr.Number(label='EXR Gamma', value=DEFAULT_EXR_GAMMA, precision=2)
-        point_mode = gr.Radio(['Positive', 'Negative'], value='Positive', label='Point Mode')
+    _settings = _load_ui_settings()
 
     with gr.Row():
-        chunk_size = gr.Number(label='VideoMaMa Chunk Size', value=16, precision=0)
-        overlap = gr.Number(label='Chunk Overlap', value=4, precision=0)
+        sequence_dir = gr.Textbox(label='Sequence Directory', value=_settings['sequence_dir'])
+        exr_gamma = gr.Number(label='EXR Gamma', value=_settings['exr_gamma'], precision=2)
+        point_mode = gr.Radio(['Positive', 'Negative'], value=_settings['point_mode'], label='Point Mode')
+
+    with gr.Row():
+        chunk_size = gr.Number(label='VideoMaMa Chunk Size', value=_settings['chunk_size'], precision=0)
+        overlap = gr.Number(label='Chunk Overlap', value=_settings['overlap'], precision=0)
+        resume_from_tmp = gr.Checkbox(
+            label='Resume from tmp (reuse cached frames, points, masks)',
+            value=_settings['resume_from_tmp'],
+        )
+
+    with gr.Row():
+        range_start = gr.Number(label='Process Start Frame', value=_settings['range_start'], precision=0)
+        range_end = gr.Number(label='Process End Frame (-1 = last)', value=_settings['range_end'], precision=0)
 
     with gr.Row():
         init_btn = gr.Button('Initialize Models')
@@ -494,7 +757,7 @@ with gr.Blocks(title='VideoMaMa Production Sequence App') as demo:
         clear_frame_btn = gr.Button('Clear Frame Points')
         clear_all_btn = gr.Button('Clear All Prompts')
         gen_masks_btn = gr.Button('Generate SAM 3 Masks')
-        run_btn = gr.Button('Run Whole Sequence')
+        run_btn = gr.Button('Run VideoMaMa (Selected Range)')
 
     frame_slider = gr.Slider(label='Current Frame', minimum=0, maximum=0, value=0, step=1, interactive=False)
     frame_info = gr.Textbox(label='Frame Info')
@@ -516,10 +779,17 @@ with gr.Blocks(title='VideoMaMa Production Sequence App') as demo:
     output_dir = gr.Textbox(label='Saved VideoMaMa Output Directory')
     status = gr.Textbox(label='Status')
 
+    # Persist the input panel whenever any setting changes, so the next launch
+    # restores the same session configuration.
+    settings_inputs = [sequence_dir, exr_gamma, point_mode, chunk_size, overlap, resume_from_tmp,
+                       range_start, range_end]
+    for _component in settings_inputs:
+        _component.change(_save_ui_settings, inputs=settings_inputs, outputs=None)
+
     init_btn.click(initialize_models, outputs=status)
     load_btn.click(
         load_sequence,
-        inputs=[sequence_dir, exr_gamma],
+        inputs=[sequence_dir, exr_gamma, resume_from_tmp],
         outputs=[preview, mask_img, output_img, state, frame_slider, frame_info, keyframes_info, mask_dir, output_dir, status],
     )
     frame_slider.release(
@@ -564,12 +834,20 @@ with gr.Blocks(title='VideoMaMa Production Sequence App') as demo:
     )
     run_btn.click(
         run_sequence,
-        inputs=[state, chunk_size, overlap],
+        inputs=[state, chunk_size, overlap, range_start, range_end],
         outputs=[preview, mask_img, output_img, state, frame_slider, frame_info, keyframes_info, mask_dir, output_dir, status],
     )
 
 
 if __name__ == '__main__':
+    # Anchor the long-running server to a stable absolute directory. The repo's
+    # network-mount cwd can vanish mid-session, after which Gradio's request
+    # handlers crash on os.getcwd(); cd-ing to an absolute local dir avoids that.
+    try:
+        os.chdir(_GRADIO_TMP)
+    except OSError:
+        pass
+
     server_name = os.environ.get('VIDEOMAMA_UI_HOST', '127.0.0.1')
     server_port = int(os.environ.get('VIDEOMAMA_UI_PORT', '7861'))
     share = os.environ.get('VIDEOMAMA_UI_SHARE', '1') not in {'0', 'false', 'False'}

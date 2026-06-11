@@ -80,6 +80,29 @@ Override at launch with environment variables, for example:
 VIDEOMAMA_UI_PORT=7862 VIDEOMAMA_UI_SHARE=0 bash scripts/run_production_frame_ui.sh
 ```
 
+The launch script pins `GRADIO_TEMP_DIR`/`GRADIO_EXAMPLES_CACHE` to absolute local
+paths and runs from a stable cwd. This network mount can swap the working
+directory out mid-session; Gradio resolves some cache paths relative to the cwd
+and calls `getcwd()` per request, which otherwise 500s the file routes with
+`FileNotFoundError`. `production_frame_app.py` sets the same defaults before
+importing gradio, so running it directly is also safe.
+
+## VRAM And Long Sequences
+
+SAM 3 and VideoMaMa are co-resident on one GPU, so long shots can OOM in the
+VideoMaMa matting pass (the VAE encode of a chunk is the usual peak). Mitigations
+already wired in:
+
+- `scripts/run_production_frame_ui.sh` exports `PYTORCH_ALLOC_CONF=expandable_segments:True`
+  (and the legacy `PYTORCH_CUDA_ALLOC_CONF`) to reduce allocator fragmentation.
+- `demo/production_frame_app.py` calls `torch.cuda.empty_cache()` after SAM 3 mask
+  generation and after each VideoMaMa chunk.
+- `pipeline_svd_mask.py` encodes the VAE in sub-batches; tune with
+  `VIDEOMAMA_VAE_ENCODE_CHUNK` (default 4, lower if the encode still OOMs).
+
+If you still OOM, lower the UI "VideoMaMa Chunk Size" (default 16) and/or
+`VIDEOMAMA_VAE_ENCODE_CHUNK` before touching model code.
+
 ## Production UI Flow
 
 `demo/production_frame_app.py` does the following:
@@ -94,6 +117,32 @@ VIDEOMAMA_UI_PORT=7862 VIDEOMAMA_UI_SHARE=0 bash scripts/run_production_frame_ui
 8. Saves outputs under `videomama_frames` and grayscale alpha previews under `alpha_frames`.
 
 The production app supports `.exr`, `.png`, `.jpg`, `.jpeg`, `.tif`, and `.tiff` inputs. EXR RGB conversion uses `OpenEXR`/`Imath`, `exr_gamma`, and exposure handling in code.
+
+### Session Persistence And Resume
+
+- The input panel (sequence directory, EXR gamma, point mode, chunk size, overlap,
+  resume toggle) is saved to `tmp/production_sequence_app/ui_settings.json` on every
+  change and reloaded as the defaults on the next launch.
+- On "Load Sequence", if "Resume from tmp" is enabled the app looks for the most
+  recent prior run of the same sequence under `tmp/production_sequence_app/` (matched
+  via each run's `session.json`, or directory-name fallback for older runs) and
+  restores its keyframe points (`keyframe_prompts.json`), generated masks
+  (`sam3_masks/`), and VideoMaMa outputs (`videomama_frames/`). Cached 1024x576
+  working frames are reused when the frame count and gamma match, so resume is fast.
+- The app's working area is anchored to `<repo>/tmp/production_sequence_app/`
+  (`APP_TMP_ROOT`) regardless of the launch directory.
+
+### Processing A Frame Subrange
+
+- "Process Start Frame" / "Process End Frame" inputs limit the "Run VideoMaMa
+  (Selected Range)" pass to `[start, end]` inclusive. End `-1` (the default) means
+  the last frame, so the whole sequence is selected unless narrowed.
+- SAM 3 mask generation stays whole-sequence (one consistent propagation; masks
+  persist), so generate masks once and then matte any range. Range runs reuse those
+  masks and write per-frame outputs into the same `videomama_frames/` / `alpha_frames/`.
+- Because outputs persist per frame, you can matte segment by segment (e.g. 0–15,
+  then 12–27). Set the next range's start a few frames before the previous end; the
+  chunk overlap re-processes those shared frames so the segment boundary blends.
 
 ## Inference CLI
 

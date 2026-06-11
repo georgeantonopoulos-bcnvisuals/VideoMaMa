@@ -965,9 +965,20 @@ class VideoInferencePipeline:
 
     def _tensor_to_vae_latent(self, t: torch.Tensor):
         """Encodes a video tensor into the VAE's latent space."""
+        import os
+
         video_length = t.shape[1]
         t = rearrange(t, "b f c h w -> (b f) c h w")
-        latents = self.vae.encode(t).latent_dist.sample()
+        # Encode in sub-batches to bound peak VRAM. The VAE encoder allocates a
+        # large group-norm activation over the full-resolution frames, so encoding
+        # a whole chunk at once OOMs on long clips. This mirrors the chunked decode
+        # in run(); AutoencoderKLTemporalDecoder has no built-in slicing, hence the
+        # manual loop. Tune the sub-batch with VIDEOMAMA_VAE_ENCODE_CHUNK.
+        encode_chunk = max(1, int(os.environ.get("VIDEOMAMA_VAE_ENCODE_CHUNK", "4")))
+        latent_chunks = []
+        for i in range(0, t.shape[0], encode_chunk):
+            latent_chunks.append(self.vae.encode(t[i: i + encode_chunk]).latent_dist.sample())
+        latents = torch.cat(latent_chunks, dim=0)
         latents = rearrange(latents, "(b f) c h w -> b f c h w", f=video_length)
         return latents * self.vae.config.scaling_factor
 

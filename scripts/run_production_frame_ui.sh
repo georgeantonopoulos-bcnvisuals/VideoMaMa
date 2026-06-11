@@ -37,6 +37,22 @@ export VIDEOMAMA_UI_PORT="${VIDEOMAMA_UI_PORT:-7861}"
 export VIDEOMAMA_UI_SHARE="${VIDEOMAMA_UI_SHARE:-1}"
 export SAM3_MODEL_VERSION="${SAM3_MODEL_VERSION:-sam3}"
 
+# SAM 3 and VideoMaMa share one GPU, so the allocator churns between two large
+# models across many chunks. expandable_segments lets PyTorch grow allocations in
+# place instead of fragmenting, which avoids spurious OOMs on long sequences.
+# torch >= 2.5 reads PYTORCH_ALLOC_CONF; the older name still works as an alias.
+export PYTORCH_ALLOC_CONF="${PYTORCH_ALLOC_CONF:-expandable_segments:True}"
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+
+# Gradio resolves some cache/temp paths relative to the process working directory
+# and calls getcwd() per request. The repo lives on a network mount whose cwd can
+# be swapped out mid-session, after which getcwd() fails and Gradio's file routes
+# crash. Pin these to absolute local paths and run from a stable cwd.
+export GRADIO_TEMP_DIR="${GRADIO_TEMP_DIR:-${TMPDIR:-/tmp}/videomama-gradio}"
+export GRADIO_EXAMPLES_CACHE="${GRADIO_EXAMPLES_CACHE:-${GRADIO_TEMP_DIR}/examples}"
+mkdir -p "${GRADIO_TEMP_DIR}" "${GRADIO_EXAMPLES_CACHE}"
+cd "${GRADIO_TEMP_DIR}"
+
 # shellcheck disable=SC1091
 source "${UI_VENV}/bin/activate"
 if ! python -c "import gradio, fastapi, starlette; assert tuple(map(int, starlette.__version__.split('.')[:2])) < (0, 39)" >/dev/null 2>&1; then

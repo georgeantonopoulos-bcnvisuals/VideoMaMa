@@ -16,7 +16,34 @@
 
 set -euo pipefail
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# If the invoking shell's working directory was deleted or swapped out from
+# under it (common on network mounts that get remounted or rsynced), getcwd()
+# fails and every child process we spawn (pyenv, python, pip) breaks with
+# "getcwd: cannot access parent directories". Move into this script's own
+# directory first; cd-ing to an absolute path works regardless of whether the
+# old cwd is still valid, which repairs the cwd for all subprocesses.
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
+if [[ -z "${SCRIPT_DIR}" ]]; then
+  echo "Cannot resolve this script's directory." >&2
+  echo "Your current directory may have been deleted; cd into a valid directory (e.g. the repo root) and re-run." >&2
+  exit 1
+fi
+cd "${SCRIPT_DIR}"
+
+# Do not run under sudo. sudo switches to root's HOME/PATH, so the user's
+# pyenv (~/.pyenv) and python3.12 become invisible and interpreter detection
+# fails with a misleading "Missing interpreter". It would also leave the /tmp
+# venvs and .videomama-env owned by root, which the normal user cannot use.
+# These venvs live in /tmp and the repo, both writable by the invoking user.
+if [[ -n "${SUDO_USER:-}" ]]; then
+  echo "Do not run this script with sudo." >&2
+  echo "It only writes to /tmp and the repo, which your user already owns; sudo hides your" >&2
+  echo "pyenv/python3.12 and creates root-owned venvs. Re-run as yourself:" >&2
+  echo "    bash ${BASH_SOURCE[0]} ${*:-}" >&2
+  exit 1
+fi
+
+REPO_ROOT="$(cd .. && pwd)"
 ENV_FILE="${REPO_ROOT}/.videomama-env"
 
 DEFAULT_CHECKPOINTS="/mnt/production/project/bcn_lib/work/AI/VideoMaMa/checkpoints"
@@ -38,10 +65,17 @@ log() { printf '[videomama-bootstrap] %s\n' "$*"; }
 
 resolve_pyenv_python() {
   local version_prefix="$1"
-  local pyenv_cmd=""
+  local pyenv_cmd="" candidate
 
-  if command -v pyenv >/dev/null 2>&1; then
-    pyenv_cmd="$(command -v pyenv)"
+  # Standard pyenv installs define `pyenv` as a shell function, so `command -v
+  # pyenv` can return the bare name "pyenv" rather than an executable path. That
+  # name is not callable from this non-interactive script (its `command pyenv`
+  # body needs ~/.pyenv/bin on PATH, which we cannot assume), so only trust
+  # command -v when it yields a real executable path. Otherwise fall back to the
+  # known pyenv binary location.
+  candidate="$(command -v pyenv 2>/dev/null || true)"
+  if [[ "${candidate}" == /* && -x "${candidate}" ]]; then
+    pyenv_cmd="${candidate}"
   elif [[ -x "${PYENV_BIN}" ]]; then
     pyenv_cmd="${PYENV_BIN}"
   else
@@ -49,12 +83,20 @@ resolve_pyenv_python() {
   fi
 
   local version
-  version="$("${pyenv_cmd}" versions --bare | awk -v prefix="${version_prefix}" '$0 ~ "^" prefix "(\\.|$)" { print; exit }')"
+  version="$("${pyenv_cmd}" versions --bare 2>/dev/null | awk -v prefix="${version_prefix}" '$0 ~ "^" prefix "(\\.|$)" { print; exit }')"
   if [[ -z "${version}" ]]; then
     return 1
   fi
 
-  PYENV_VERSION="${version}" "${pyenv_cmd}" which python
+  # Prefer pyenv's own resolution, but fall back to the on-disk layout in case
+  # `pyenv which` is unhappy in a stripped-down environment.
+  local py
+  py="$(PYENV_VERSION="${version}" "${pyenv_cmd}" which python 2>/dev/null || true)"
+  if [[ -z "${py}" || ! -x "${py}" ]]; then
+    py="${PYENV_ROOT}/versions/${version}/bin/python"
+  fi
+  [[ -x "${py}" ]] || return 1
+  printf '%s\n' "${py}"
 }
 
 resolve_ui_python() {

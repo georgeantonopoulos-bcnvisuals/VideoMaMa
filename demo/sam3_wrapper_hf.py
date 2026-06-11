@@ -197,15 +197,27 @@ class SAM3VideoTracker:
             for frame_idx, outputs in latest_outputs.items():
                 final_masks[frame_idx] = self._extract_mask(outputs, (height, width), obj_id=obj_id)
 
-            for response in self.predictor.handle_stream_request(
-                request={
-                    "type": "propagate_in_video",
-                    "session_id": session_id,
-                    "start_frame_index": keyframes[0],
-                }
-            ):
-                frame_idx = int(response["frame_index"])
-                final_masks[frame_idx] = self._extract_mask(response.get("outputs", {}), (height, width), obj_id=obj_id)
+            # SAM 3's add_prompt path runs the model under a bf16 autocast context,
+            # but the library's propagate_in_video (sam3_base_predictor) does not wrap
+            # the model forward. Its detector casts the backbone features to bfloat16
+            # while the conv layers keep float32 weights, so the propagation forward
+            # only has matching dtypes inside an autocast context. Without this the
+            # streamed forward raises in conv_s0:
+            #   "Input type (c10::BFloat16) and bias type (float) should be the same".
+            # The generator runs the model lazily per `next()`, so autocast must stay
+            # active across the whole iteration, not just generator creation.
+            import torch
+
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                for response in self.predictor.handle_stream_request(
+                    request={
+                        "type": "propagate_in_video",
+                        "session_id": session_id,
+                        "start_frame_index": keyframes[0],
+                    }
+                ):
+                    frame_idx = int(response["frame_index"])
+                    final_masks[frame_idx] = self._extract_mask(response.get("outputs", {}), (height, width), obj_id=obj_id)
         finally:
             self._close_session(session_id)
 
