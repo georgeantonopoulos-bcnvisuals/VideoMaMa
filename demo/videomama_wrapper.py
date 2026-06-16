@@ -50,11 +50,14 @@ def videomama(pipeline, frames_np, mask_frames_np):
         mask_cond_mode="vae"
     )
     
-    # Resize back to original resolution
-    original_size = frames_pil[0].size
-    output_frames_resized = [f.resize(original_size, Image.Resampling.BILINEAR) 
-                            for f in output_frames_pil]
-    
+    # Resize each output back to its matching input resolution. Production shots
+    # should be consistent, but pairing frame-by-frame prevents accidental first-
+    # frame sizing from leaking into mixed-resolution or retimed test inputs.
+    output_frames_resized = [
+        out.resize(src.size, Image.Resampling.BILINEAR)
+        for out, src in zip(output_frames_pil, frames_pil)
+    ]
+
     # Convert back to numpy arrays
     output_frames_np = [np.array(f) for f in output_frames_resized]
     

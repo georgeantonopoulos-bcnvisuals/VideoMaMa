@@ -7,6 +7,7 @@ newer Python/PyTorch stack than the base VideoMaMa inference environment.
 
 import json
 import os
+import shutil
 import sys
 import time
 from pathlib import Path
@@ -99,6 +100,19 @@ DEFAULT_SETTINGS = {
     'range_end': -1,
 }
 
+APP_CSS = """
+.accurate-preview img,
+.accurate-preview canvas,
+.accurate-preview video {
+    object-fit: contain !important;
+}
+#large_prompt_preview img,
+#large_prompt_preview canvas {
+    object-fit: contain !important;
+    max-height: 78vh !important;
+}
+"""
+
 sam3_tracker = None
 videomama_pipeline = None
 
@@ -177,8 +191,90 @@ def _load_rgb_frame(image_path: str, exr_gamma: float) -> np.ndarray:
     return np.array(Image.open(image_path).convert("RGB"))
 
 
-def _resize_rgb_frame(frame: np.ndarray) -> np.ndarray:
-    return np.array(Image.fromarray(frame).resize((WORK_WIDTH, WORK_HEIGHT), Image.Resampling.BILINEAR))
+def _image_size(image_path: str):
+    suffix = Path(image_path).suffix.lower()
+    if suffix == ".exr":
+        exr_file = OpenEXR.InputFile(str(image_path))
+        data_window = exr_file.header()["dataWindow"]
+        width = data_window.max.x - data_window.min.x + 1
+        height = data_window.max.y - data_window.min.y + 1
+        return int(width), int(height)
+    with Image.open(image_path) as image:
+        return image.size
+
+
+def _resize_mask(mask: np.ndarray, size, resample=Image.Resampling.NEAREST) -> np.ndarray:
+    width, height = int(size[0]), int(size[1])
+    if mask.shape[:2] == (height, width):
+        return mask.astype(np.uint8)
+    return np.array(Image.fromarray(mask.astype(np.uint8)).resize((width, height), resample))
+
+
+def _letterbox_transform(source_width: int, source_height: int):
+    scale = min(WORK_WIDTH / source_width, WORK_HEIGHT / source_height)
+    content_width = max(1, int(round(source_width * scale)))
+    content_height = max(1, int(round(source_height * scale)))
+    pad_x = (WORK_WIDTH - content_width) // 2
+    pad_y = (WORK_HEIGHT - content_height) // 2
+    return {
+        'source_width': int(source_width),
+        'source_height': int(source_height),
+        'content_width': int(content_width),
+        'content_height': int(content_height),
+        'pad_x': int(pad_x),
+        'pad_y': int(pad_y),
+        'scale': float(scale),
+    }
+
+
+def _letterbox_rgb_frame(frame: np.ndarray):
+    """Fit a source frame into the fixed SAM/UI work canvas without stretching."""
+    source_height, source_width = frame.shape[:2]
+    transform = _letterbox_transform(source_width, source_height)
+    content_width = transform['content_width']
+    content_height = transform['content_height']
+    pad_x = transform['pad_x']
+    pad_y = transform['pad_y']
+    resized = Image.fromarray(frame).resize((content_width, content_height), Image.Resampling.BILINEAR)
+    canvas = np.zeros((WORK_HEIGHT, WORK_WIDTH, 3), dtype=np.uint8)
+    canvas[pad_y:pad_y + content_height, pad_x:pad_x + content_width] = np.array(resized)
+    return canvas, transform
+
+
+def _work_mask_to_source(mask: np.ndarray, transform) -> np.ndarray:
+    """Remove UI/SAM letterbox padding and resize a work mask to source size."""
+    if not transform:
+        return mask.astype(np.uint8)
+    pad_x = int(transform.get('pad_x', 0))
+    pad_y = int(transform.get('pad_y', 0))
+    content_width = int(transform.get('content_width', mask.shape[1]))
+    content_height = int(transform.get('content_height', mask.shape[0]))
+    source_size = (int(transform['source_width']), int(transform['source_height']))
+    cropped = mask[pad_y:pad_y + content_height, pad_x:pad_x + content_width]
+    return _resize_mask(cropped, source_size)
+
+
+def _source_mask_to_work(mask: np.ndarray, transform) -> np.ndarray:
+    """Letterbox a source-resolution mask back to the fixed UI/SAM canvas."""
+    if not transform:
+        return _resize_mask(mask, (WORK_WIDTH, WORK_HEIGHT))
+    pad_x = int(transform.get('pad_x', 0))
+    pad_y = int(transform.get('pad_y', 0))
+    content_width = int(transform.get('content_width', WORK_WIDTH))
+    content_height = int(transform.get('content_height', WORK_HEIGHT))
+    resized = _resize_mask(mask, (content_width, content_height))
+    canvas = np.zeros((WORK_HEIGHT, WORK_WIDTH), dtype=np.uint8)
+    canvas[pad_y:pad_y + content_height, pad_x:pad_x + content_width] = resized
+    return canvas
+
+
+def _point_in_content(state, frame_idx, x, y):
+    transform = (state.get('frame_transforms') or [{}])[frame_idx]
+    pad_x = int(transform.get('pad_x', 0))
+    pad_y = int(transform.get('pad_y', 0))
+    content_width = int(transform.get('content_width', WORK_WIDTH))
+    content_height = int(transform.get('content_height', WORK_HEIGHT))
+    return pad_x <= x < pad_x + content_width and pad_y <= y < pad_y + content_height
 
 
 def _discover_sequence_files(sequence_dir: str):
@@ -207,13 +303,16 @@ def _run_root(base_name: str):
     return APP_TMP_ROOT / f"{time.strftime('%Y%m%d_%H%M%S')}_{_safe_name(base_name)}"
 
 
-def _write_session_meta(run_root: Path, sequence_dir: str, exr_gamma: float, frame_names):
+def _write_session_meta(run_root: Path, sequence_dir: str, exr_gamma: float, frame_names, frame_sizes, frame_transforms=None):
     """Record which sequence a run belongs to so it can be matched on resume."""
     meta = {
         'sequence_dir': str(Path(sequence_dir).resolve()),
         'exr_gamma': float(exr_gamma),
         'frame_count': len(frame_names),
         'frame_names': list(frame_names),
+        'frame_sizes': [[int(width), int(height)] for width, height in frame_sizes],
+        'frame_transforms': frame_transforms or [],
+        'work_size': [WORK_WIDTH, WORK_HEIGHT],
     }
     try:
         with (Path(run_root) / 'session.json').open('w', encoding='utf-8') as f:
@@ -238,7 +337,12 @@ def _find_existing_run(sequence_dir: str, frame_names):
             try:
                 with meta_path.open('r', encoding='utf-8') as f:
                     meta = json.load(f)
-                matches = str(meta.get('sequence_dir')) == resolved and int(meta.get('frame_count', -1)) == frame_count
+                matches = (
+                    str(meta.get('sequence_dir')) == resolved
+                    and int(meta.get('frame_count', -1)) == frame_count
+                    and (not meta.get('frame_names') or list(meta.get('frame_names')) == list(frame_names))
+                    and (not meta.get('work_size') or list(meta.get('work_size')) == [WORK_WIDTH, WORK_HEIGHT])
+                )
             except (json.JSONDecodeError, OSError, ValueError, TypeError):
                 matches = False
         elif run_dir.name.endswith('_' + safe):
@@ -347,7 +451,9 @@ def _videomama_output_path(state, frame_idx):
 def _load_current_mask(state, frame_idx):
     mask_path = _mask_output_path(state, frame_idx)
     if mask_path is not None and mask_path.exists():
-        return np.array(Image.open(mask_path).convert('L'))
+        mask = np.array(Image.open(mask_path).convert('L'))
+        transform = (state.get('frame_transforms') or [{}])[frame_idx]
+        return _source_mask_to_work(mask, transform)
 
     preview_masks = state.get('preview_masks', {})
     cached_mask = preview_masks.get(str(frame_idx))
@@ -400,9 +506,11 @@ def _ui_state_payload(state, status_message):
     preview, mask, output_preview = _render_frame_preview(state, state['current_frame_idx'])
     return (
         preview,
+        preview,
         mask,
         output_preview,
         state,
+        gr.update(value=state['current_frame_idx']),
         gr.update(value=state['current_frame_idx']),
         _frame_info(state),
         _keyframe_summary(state),
@@ -416,6 +524,8 @@ def load_sequence(sequence_dir: str, exr_gamma: float, resume_from_tmp: bool = T
     exr_gamma = float(exr_gamma)
     frame_paths = _discover_sequence_files(sequence_dir)
     frame_names = [path.name for path in frame_paths]
+    frame_sizes = [_image_size(str(path)) for path in frame_paths]
+    frame_transforms = [_letterbox_transform(width, height) for width, height in frame_sizes]
 
     existing_run = _find_existing_run(sequence_dir, frame_names) if resume_from_tmp else None
     run_root = existing_run if existing_run is not None else _run_root(Path(sequence_dir).name)
@@ -426,14 +536,19 @@ def load_sequence(sequence_dir: str, exr_gamma: float, resume_from_tmp: bool = T
     # gamma-matching set; otherwise (re)build the 1024x576 JPEG cache.
     cached_jpgs = sorted(cache_dir.glob('*.jpg'))
     cached_gamma = None
+    cached_has_letterbox_meta = False
     if existing_run is not None and (run_root / 'session.json').exists():
         try:
             with (run_root / 'session.json').open('r', encoding='utf-8') as f:
-                cached_gamma = float(json.load(f).get('exr_gamma'))
+                cached_meta = json.load(f)
+            cached_gamma = float(cached_meta.get('exr_gamma'))
+            cached_transforms = cached_meta.get('frame_transforms') or []
+            cached_has_letterbox_meta = len(cached_transforms) == len(frame_paths)
         except (json.JSONDecodeError, OSError, TypeError, ValueError):
             cached_gamma = None
     reuse_cache = (
         existing_run is not None
+        and cached_has_letterbox_meta
         and len(cached_jpgs) == len(frame_paths)
         and (cached_gamma is None or abs(cached_gamma - exr_gamma) < 1e-6)
     )
@@ -446,17 +561,19 @@ def load_sequence(sequence_dir: str, exr_gamma: float, resume_from_tmp: bool = T
         print(f"Preparing {len(frame_paths)} frames for SAM 3/UI cache...")
         for idx, frame_path in enumerate(frame_paths):
             frame = _load_rgb_frame(str(frame_path), exr_gamma=exr_gamma)
-            working_frame = _resize_rgb_frame(frame)
+            working_frame, frame_transforms[idx] = _letterbox_rgb_frame(frame)
             cache_path = cache_dir / f"{idx:05d}.jpg"
             Image.fromarray(working_frame).save(cache_path, quality=95)
             cache_frame_paths.append(str(cache_path))
 
-    _write_session_meta(run_root, sequence_dir, exr_gamma, frame_names)
+    _write_session_meta(run_root, sequence_dir, exr_gamma, frame_names, frame_sizes, frame_transforms)
 
     state = {
         'sequence_dir': str(Path(sequence_dir).resolve()),
         'frame_paths': [str(path) for path in frame_paths],
         'frame_names': frame_names,
+        'frame_sizes': [[int(width), int(height)] for width, height in frame_sizes],
+        'frame_transforms': frame_transforms,
         'cache_dir': str(cache_dir),
         'cache_frame_paths': cache_frame_paths,
         'current_frame_idx': 0,
@@ -479,14 +596,26 @@ def load_sequence(sequence_dir: str, exr_gamma: float, resume_from_tmp: bool = T
 
         masks_dir = run_root / 'sam3_masks'
         first_stem = Path(frame_names[0]).stem
-        if masks_dir.is_dir() and (masks_dir / f"{first_stem}.png").exists():
-            state['generated_masks_dir'] = str(masks_dir)
-            restored.append('SAM 3 masks')
+        first_mask_path = masks_dir / f"{first_stem}.png"
+        if masks_dir.is_dir() and first_mask_path.exists():
+            with Image.open(first_mask_path) as first_mask:
+                mask_size = first_mask.size
+            if mask_size == tuple(frame_sizes[0]):
+                state['generated_masks_dir'] = str(masks_dir)
+                restored.append('SAM 3 masks')
+            else:
+                print(f"Ignoring stale SAM 3 masks with size {mask_size}; source is {frame_sizes[0]}")
 
         outputs_dir = run_root / 'videomama_frames'
-        if outputs_dir.is_dir() and (outputs_dir / f"{first_stem}.png").exists():
-            state['videomama_output_dir'] = str(outputs_dir)
-            restored.append('VideoMaMa outputs')
+        first_output_path = outputs_dir / f"{first_stem}.png"
+        if outputs_dir.is_dir() and first_output_path.exists():
+            with Image.open(first_output_path) as first_output:
+                output_size = first_output.size
+            if output_size == tuple(frame_sizes[0]):
+                state['videomama_output_dir'] = str(outputs_dir)
+                restored.append('VideoMaMa outputs')
+            else:
+                print(f"Ignoring stale VideoMaMa outputs with size {output_size}; source is {frame_sizes[0]}")
         alpha_dir = run_root / 'alpha_frames'
         if alpha_dir.is_dir() and any(alpha_dir.glob('*.png')):
             state['alpha_output_dir'] = str(alpha_dir)
@@ -505,9 +634,11 @@ def load_sequence(sequence_dir: str, exr_gamma: float, resume_from_tmp: bool = T
     preview, mask, output_preview = _render_frame_preview(state, 0)
     return (
         preview,
+        preview,
         mask,
         output_preview,
         state,
+        gr.update(minimum=0, maximum=len(frame_paths) - 1, value=0, step=1, interactive=True),
         gr.update(minimum=0, maximum=len(frame_paths) - 1, value=0, step=1, interactive=True),
         _frame_info(state),
         _keyframe_summary(state),
@@ -515,6 +646,39 @@ def load_sequence(sequence_dir: str, exr_gamma: float, resume_from_tmp: bool = T
         state.get('videomama_output_dir') or '',
         status_message,
     )
+
+
+def clear_sequence_cache_and_reload(state, sequence_dir: str, exr_gamma: float):
+    """Delete this sequence's current app cache/run directory, then load fresh frames."""
+    removed = []
+    candidate_roots = []
+    if state and state.get('run_root'):
+        candidate_roots.append(Path(state['run_root']))
+    else:
+        try:
+            frame_paths = _discover_sequence_files(sequence_dir)
+            frame_names = [path.name for path in frame_paths]
+            existing_run = _find_existing_run(sequence_dir, frame_names)
+            if existing_run is not None:
+                candidate_roots.append(existing_run)
+        except Exception:
+            candidate_roots = []
+
+    for run_root in dict.fromkeys(candidate_roots):
+        run_root = Path(run_root)
+        try:
+            # Safety: only remove per-run directories anchored under APP_TMP_ROOT.
+            if run_root.exists() and run_root.parent == APP_TMP_ROOT and run_root.name != APP_TMP_ROOT.name:
+                shutil.rmtree(run_root)
+                removed.append(run_root.name)
+        except OSError as exc:
+            raise gr.Error(f"Could not clear sequence cache {run_root}: {exc}") from exc
+
+    _free_cuda_cache()
+    payload = list(load_sequence(sequence_dir, exr_gamma, resume_from_tmp=False))
+    suffix = f" Cleared cache run(s): {', '.join(removed)}." if removed else " No prior cache run was found; loaded fresh."
+    payload[-1] = str(payload[-1]) + suffix
+    return tuple(payload)
 
 
 def select_frame(state, frame_index):
@@ -551,6 +715,8 @@ def add_point(state, point_mode, evt: gr.SelectData):
     frame_idx = state['current_frame_idx']
     prompts = _prompt_data_for_frame(state, frame_idx)
     x, y = int(evt.index[0]), int(evt.index[1])
+    if not _point_in_content(state, frame_idx, x, y):
+        raise gr.Error('Click inside the image area, not the letterbox padding.')
     prompts['points'].append([x, y])
     prompts['labels'].append(1 if point_mode == 'Positive' else 0)
     _compute_preview_mask(state, frame_idx)
@@ -623,13 +789,18 @@ def generate_sam3_masks(state):
     # the co-resident VideoMaMa matting pass has room on the same GPU.
     _free_cuda_cache()
 
-    for frame_name, mask in zip(state['frame_names'], masks):
-        Image.fromarray(mask).save(mask_dir / f"{Path(frame_name).stem}.png")
+    for frame_idx, (frame_name, mask) in enumerate(zip(state['frame_names'], masks)):
+        transform = (state.get('frame_transforms') or [{}])[frame_idx]
+        source_mask = _work_mask_to_source(mask, transform)
+        Image.fromarray(source_mask).save(mask_dir / f"{Path(frame_name).stem}.png")
 
     state['generated_masks_dir'] = str(mask_dir)
     state['videomama_output_dir'] = None
     state['alpha_output_dir'] = None
-    return _ui_state_payload(state, f"Generated {len(masks)} SAM 3 masks using {_keyframe_summary(state)}")
+    return _ui_state_payload(
+        state,
+        f"Generated {len(masks)} SAM 3 masks at source resolution using {_keyframe_summary(state)}",
+    )
 
 
 def _resolve_range(range_start, range_end, total_frames):
@@ -698,6 +869,9 @@ def run_sequence(state, chunk_size, overlap, range_start=0, range_end=-1):
         for local_idx in range(keep_from, len(output_frames)):
             frame_name = chunk_frame_names[local_idx]
             output_frame = output_frames[local_idx]
+            source_size = tuple(state['frame_sizes'][start + local_idx])
+            if output_frame.shape[:2] != (source_size[1], source_size[0]):
+                output_frame = np.array(Image.fromarray(output_frame).resize(source_size, Image.Resampling.BILINEAR))
             output_path = output_dir / f"{Path(frame_name).stem}.png"
             alpha_path = alpha_dir / f"{Path(frame_name).stem}.png"
             Image.fromarray(output_frame).save(output_path)
@@ -722,7 +896,7 @@ def run_sequence(state, chunk_size, overlap, range_start=0, range_end=-1):
     )
 
 
-with gr.Blocks(title='VideoMaMa Production Sequence App') as demo:
+with gr.Blocks(title='VideoMaMa Production Sequence App', css=APP_CSS) as demo:
     gr.Markdown('# VideoMaMa Production Sequence App')
     gr.Markdown('Load an EXR or image sequence, add SAM 3 prompts on multiple keyframes, generate the full mask track, then run VideoMaMa over the whole shot.')
     gr.Markdown('Workflow: Initialize models, load the sequence, navigate frames, add prompts on the frames that need correction, generate SAM 3 masks, then run the whole sequence.')
@@ -751,6 +925,7 @@ with gr.Blocks(title='VideoMaMa Production Sequence App') as demo:
     with gr.Row():
         init_btn = gr.Button('Initialize Models')
         load_btn = gr.Button('Load Sequence')
+        clear_cache_reload_btn = gr.Button('Clear Sequence Cache + Reload')
         prev_btn = gr.Button('Prev Frame')
         next_btn = gr.Button('Next Frame')
         undo_btn = gr.Button('Undo Point')
@@ -770,14 +945,35 @@ with gr.Blocks(title='VideoMaMa Production Sequence App') as demo:
             interactive=False,
             sources=[],
             show_download_button=False,
-            show_fullscreen_button=False,
+            show_fullscreen_button=True,
+            elem_classes=['accurate-preview'],
         )
-        mask_img = gr.Image(label='Current SAM 3 Mask', type='numpy')
-        output_img = gr.Image(label='Current VideoMaMa Output', type='numpy')
+        mask_img = gr.Image(label='Current SAM 3 Mask', type='numpy', elem_classes=['accurate-preview'])
+        output_img = gr.Image(label='Current VideoMaMa Output', type='numpy', elem_classes=['accurate-preview'])
+
+    with gr.Accordion('Large Accurate Prompt View (scrub and click here for precise points)', open=False):
+        gr.Markdown('This large view uses the same letterboxed SAM working frame, so click coordinates match the mask tracker. Use the fullscreen icon for maximum precision.')
+        large_frame_slider = gr.Slider(label='Large View Current Frame', minimum=0, maximum=0, value=0, step=1, interactive=False)
+        preview_large = gr.Image(
+            label='Large Sequence Preview / Prompt Overlay',
+            type='numpy',
+            interactive=False,
+            sources=[],
+            height=720,
+            show_download_button=False,
+            show_fullscreen_button=True,
+            elem_id='large_prompt_preview',
+            elem_classes=['accurate-preview'],
+        )
 
     mask_dir = gr.Textbox(label='Saved Mask Directory')
     output_dir = gr.Textbox(label='Saved VideoMaMa Output Directory')
     status = gr.Textbox(label='Status')
+
+    ui_outputs = [
+        preview, preview_large, mask_img, output_img, state, frame_slider, large_frame_slider,
+        frame_info, keyframes_info, mask_dir, output_dir, status,
+    ]
 
     # Persist the input panel whenever any setting changes, so the next launch
     # restores the same session configuration.
@@ -790,52 +986,67 @@ with gr.Blocks(title='VideoMaMa Production Sequence App') as demo:
     load_btn.click(
         load_sequence,
         inputs=[sequence_dir, exr_gamma, resume_from_tmp],
-        outputs=[preview, mask_img, output_img, state, frame_slider, frame_info, keyframes_info, mask_dir, output_dir, status],
+        outputs=ui_outputs,
+    )
+    clear_cache_reload_btn.click(
+        clear_sequence_cache_and_reload,
+        inputs=[state, sequence_dir, exr_gamma],
+        outputs=ui_outputs,
     )
     frame_slider.release(
         select_frame,
         inputs=[state, frame_slider],
-        outputs=[preview, mask_img, output_img, state, frame_slider, frame_info, keyframes_info, mask_dir, output_dir, status],
+        outputs=ui_outputs,
+    )
+    large_frame_slider.release(
+        select_frame,
+        inputs=[state, large_frame_slider],
+        outputs=ui_outputs,
     )
     prev_btn.click(
         prev_frame,
         inputs=state,
-        outputs=[preview, mask_img, output_img, state, frame_slider, frame_info, keyframes_info, mask_dir, output_dir, status],
+        outputs=ui_outputs,
     )
     next_btn.click(
         next_frame,
         inputs=state,
-        outputs=[preview, mask_img, output_img, state, frame_slider, frame_info, keyframes_info, mask_dir, output_dir, status],
+        outputs=ui_outputs,
     )
     preview.select(
         add_point,
         inputs=[state, point_mode],
-        outputs=[preview, mask_img, output_img, state, frame_slider, frame_info, keyframes_info, mask_dir, output_dir, status],
+        outputs=ui_outputs,
+    )
+    preview_large.select(
+        add_point,
+        inputs=[state, point_mode],
+        outputs=ui_outputs,
     )
     undo_btn.click(
         undo_point,
         inputs=state,
-        outputs=[preview, mask_img, output_img, state, frame_slider, frame_info, keyframes_info, mask_dir, output_dir, status],
+        outputs=ui_outputs,
     )
     clear_frame_btn.click(
         clear_frame_points,
         inputs=state,
-        outputs=[preview, mask_img, output_img, state, frame_slider, frame_info, keyframes_info, mask_dir, output_dir, status],
+        outputs=ui_outputs,
     )
     clear_all_btn.click(
         clear_all_points,
         inputs=state,
-        outputs=[preview, mask_img, output_img, state, frame_slider, frame_info, keyframes_info, mask_dir, output_dir, status],
+        outputs=ui_outputs,
     )
     gen_masks_btn.click(
         generate_sam3_masks,
         inputs=state,
-        outputs=[preview, mask_img, output_img, state, frame_slider, frame_info, keyframes_info, mask_dir, output_dir, status],
+        outputs=ui_outputs,
     )
     run_btn.click(
         run_sequence,
         inputs=[state, chunk_size, overlap, range_start, range_end],
-        outputs=[preview, mask_img, output_img, state, frame_slider, frame_info, keyframes_info, mask_dir, output_dir, status],
+        outputs=ui_outputs,
     )
 
 

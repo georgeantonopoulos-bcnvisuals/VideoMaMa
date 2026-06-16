@@ -215,3 +215,16 @@ printf '%s\n' "$VIDEOMAMA_CHECKPOINTS" "$VIDEOMAMA_BASE_MODEL_PATH" "$VIDEOMAMA_
 ```
 
 Starting the UI or running inference can require GPU access and large checkpoints. Do not assume those are available in every coding session.
+
+## Deployment Notes
+
+- 2026-06-15: For shared studio use, prefer a private service rather than Gradio share: run the production UI on a G6 GPU host behind VPN/private ALB or reverse proxy with studio SSO/basic auth, mount shared storage/checkpoints, and serialize GPU jobs until a real queue/worker layer exists.
+- For on-demand scaling, package the harness into a GPU container or AMI and run workers from a queue over shared S3/FSx/EFS storage; AWS Deadline Cloud may fit if the studio already manages VFX jobs there.
+
+## Recent Production UI Changes
+
+- 2026-06-15: `demo/production_frame_app.py` has a "Clear Sequence Cache + Reload" button that deletes the current per-sequence tmp run under `tmp/production_sequence_app/` and reloads without resuming.
+- 2026-06-15: SAM 3 masks are still tracked on the 1024x576 UI/SAM working cache, but saved to `sam3_masks/` at each source frame's original resolution; previews downsample masks back to working size for overlay.
+- 2026-06-15: `demo/videomama_wrapper.py` resizes each VideoMaMa output back to its matching source frame size, and the production app guards output saves to source resolution.
+- 2026-06-15: The production UI now letterboxes source frames into the fixed 1024x576 SAM/UI canvas instead of stretching; SAM masks are unletterboxed back to source resolution when saved. Prompt clicks in letterbox padding are rejected.
+- 2026-06-15: The production UI includes a large prompting accordion with its own scrub slider and fullscreen-enabled image for more accurate artist point picking.
