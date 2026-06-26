@@ -154,7 +154,9 @@ build_ui_venv() {
   fi
   # shellcheck disable=SC1091
   source "${UI_VENV}/bin/activate"
-  python -m pip install --upgrade pip setuptools wheel
+  # requirements-sam3-ui.txt intentionally pins setuptools<82 for SAM 3.
+  # Keep the generic bootstrap upgrade from fighting that pin on every run.
+  python -m pip install --upgrade pip wheel
   python -m pip install --index-url "${UI_TORCH_INDEX_URL}" \
       torch==2.10.0 torchvision torchaudio
   python -m pip install -r "${REPO_ROOT}/scripts/requirements-sam3-ui.txt"

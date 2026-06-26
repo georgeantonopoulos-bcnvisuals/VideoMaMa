@@ -10,6 +10,9 @@ import os
 import shutil
 import sys
 import time
+import gc
+import threading
+from collections import deque
 from pathlib import Path
 
 THIS_DIR = Path(__file__).resolve().parent
@@ -92,9 +95,12 @@ SETTINGS_PATH = APP_TMP_ROOT / 'ui_settings.json'
 DEFAULT_SETTINGS = {
     'sequence_dir': DEFAULT_SEQUENCE_DIR,
     'exr_gamma': DEFAULT_EXR_GAMMA,
+    'prompt_mode': 'Point keyframes',
+    'concept_prompt': '',
     'point_mode': 'Positive',
     'chunk_size': 16,
     'overlap': 4,
+    'custom_output_dir': '',
     'resume_from_tmp': True,
     'range_start': 0,
     'range_end': -1,
@@ -111,10 +117,81 @@ APP_CSS = """
     object-fit: contain !important;
     max-height: 78vh !important;
 }
+.danger-button {
+    background: #8f2f2f !important;
+    border-color: #7a2929 !important;
+    color: #fff7f7 !important;
+}
+.danger-button:hover {
+    background: #a43a3a !important;
+    border-color: #8f2f2f !important;
+}
+.debug-console textarea {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace !important;
+    font-size: 12px !important;
+    line-height: 1.35 !important;
+}
 """
 
 sam3_tracker = None
 videomama_pipeline = None
+_DEBUG_LINES = deque(maxlen=500)
+_DEBUG_LOCK = threading.Lock()
+UI_OUTPUT_STATUS_INDEX = 11
+UI_OUTPUT_DEBUG_INDEX = 12
+UI_OUTPUT_COUNT = 13
+CLEARED_RUN_PREFIX = "cleared"
+
+
+def _append_debug_line(line):
+    line = str(line).replace('\r', '\n')
+    for part in line.splitlines():
+        part = part.strip()
+        if not part:
+            continue
+        timestamp = time.strftime('%H:%M:%S')
+        with _DEBUG_LOCK:
+            _DEBUG_LINES.append(f"[{timestamp}] {part}")
+
+
+def _debug_console_text():
+    with _DEBUG_LOCK:
+        return '\n'.join(_DEBUG_LINES)
+
+
+class _DebugTee:
+    def __init__(self, wrapped, label):
+        self._wrapped = wrapped
+        self._label = label
+        self._buffer = ''
+
+    def write(self, data):
+        self._wrapped.write(data)
+        self._wrapped.flush()
+        if not data:
+            return
+        self._buffer += str(data)
+        while '\n' in self._buffer or '\r' in self._buffer:
+            newline_positions = [pos for pos in (self._buffer.find('\n'), self._buffer.find('\r')) if pos >= 0]
+            split_at = min(newline_positions)
+            chunk = self._buffer[:split_at]
+            self._buffer = self._buffer[split_at + 1:]
+            _append_debug_line(f"{self._label}: {chunk}")
+
+    def flush(self):
+        self._wrapped.flush()
+
+    def isatty(self):
+        return self._wrapped.isatty()
+
+    def __getattr__(self, name):
+        return getattr(self._wrapped, name)
+
+
+if not isinstance(sys.stdout, _DebugTee):
+    sys.stdout = _DebugTee(sys.stdout, 'OUT')
+if not isinstance(sys.stderr, _DebugTee):
+    sys.stderr = _DebugTee(sys.stderr, 'ERR')
 
 
 def _load_ui_settings():
@@ -132,16 +209,20 @@ def _load_ui_settings():
     return settings
 
 
-def _save_ui_settings(sequence_dir, exr_gamma, point_mode, chunk_size, overlap, resume_from_tmp,
+def _save_ui_settings(sequence_dir, exr_gamma, prompt_mode, concept_prompt, point_mode, chunk_size, overlap,
+                      custom_output_dir, resume_from_tmp,
                       range_start, range_end):
     """Persist the current input panel so the next launch restores it."""
     APP_TMP_ROOT.mkdir(parents=True, exist_ok=True)
     payload = {
         'sequence_dir': str(sequence_dir),
         'exr_gamma': float(exr_gamma),
+        'prompt_mode': str(prompt_mode),
+        'concept_prompt': str(concept_prompt or ''),
         'point_mode': str(point_mode),
         'chunk_size': int(chunk_size),
         'overlap': int(overlap),
+        'custom_output_dir': str(custom_output_dir or ''),
         'resume_from_tmp': bool(resume_from_tmp),
         'range_start': int(range_start),
         'range_end': int(range_end),
@@ -162,6 +243,45 @@ def _free_cuda_cache():
             torch.cuda.empty_cache()
     except Exception:
         pass
+
+
+def _unload_videomama_pipeline():
+    """Drop VideoMaMa weights when SAM 3 needs the GPU for propagation."""
+    global videomama_pipeline
+
+    if videomama_pipeline is None:
+        return
+    videomama_pipeline = None
+    gc.collect()
+    _free_cuda_cache()
+
+
+def _unload_sam3_tracker():
+    """Drop SAM 3 weights when VideoMaMa needs the GPU for matting."""
+    global sam3_tracker
+
+    if sam3_tracker is None:
+        return
+    sam3_tracker = None
+    gc.collect()
+    _free_cuda_cache()
+
+
+def _ensure_sam3_tracker(device):
+    global sam3_tracker
+
+    if sam3_tracker is None:
+        sam3_version = os.environ.get("SAM3_MODEL_VERSION", "sam3")
+        sam3_tracker = load_sam3_tracker(device=device, model_version=sam3_version)
+    return sam3_tracker
+
+
+def _ensure_videomama_pipeline(device):
+    global videomama_pipeline
+
+    if videomama_pipeline is None:
+        videomama_pipeline = load_videomama_pipeline(device=device)
+    return videomama_pipeline
 
 
 def _read_exr_rgb(image_path: str, exr_gamma: float = DEFAULT_EXR_GAMMA, exr_exposure: float = 0.0) -> np.ndarray:
@@ -386,23 +506,116 @@ def _load_prompts_from_run(run_root: Path):
     return restored
 
 
-def initialize_models():
-    global sam3_tracker, videomama_pipeline
-    if sam3_tracker is not None and videomama_pipeline is not None:
-        return "Models already loaded."
+def _load_concept_prompt_from_run(run_root: Path):
+    prompt_path = Path(run_root) / 'concept_prompt.json'
+    if not prompt_path.exists():
+        return ''
+    try:
+        with prompt_path.open('r', encoding='utf-8') as f:
+            saved = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return ''
+    return str(saved.get('text') or '').strip() if isinstance(saved, dict) else ''
 
+
+def initialize_models():
     import torch
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    if sam3_tracker is not None:
+        status_message = "SAM 3 already loaded. VideoMaMa will load when matting starts."
+        _append_debug_line(status_message)
+        return status_message, _debug_console_text()
+
     sam3_version = os.environ.get("SAM3_MODEL_VERSION", "sam3")
-    sam3_tracker = load_sam3_tracker(device=device, model_version=sam3_version)
-    videomama_pipeline = load_videomama_pipeline(device=device)
-    return f"Loaded SAM 3 ({sam3_version}) and VideoMaMa on {device}."
+    _ensure_sam3_tracker(device)
+    status_message = f"Loaded SAM 3 ({sam3_version}) on {device}. VideoMaMa will load when matting starts."
+    _append_debug_line(status_message)
+    return status_message, _debug_console_text()
+
+
+def refresh_debug_console():
+    return _debug_console_text()
+
+
+def clear_debug_console():
+    with _DEBUG_LOCK:
+        _DEBUG_LINES.clear()
+    return ''
+
+
+def _clear_run_dir(run_root: Path):
+    """Move an active run aside, then best-effort delete it.
+
+    Some production mounts can report `Directory not empty` while a directory tree
+    is being removed. Renaming first makes the clear-cache operation effective for
+    the UI even if physical cleanup has to be retried later.
+    """
+    run_root = Path(run_root)
+    if not run_root.exists() or run_root.parent != APP_TMP_ROOT or run_root.name == APP_TMP_ROOT.name:
+        return None, None
+
+    trash_root = APP_TMP_ROOT / f"{CLEARED_RUN_PREFIX}_{time.strftime('%Y%m%d_%H%M%S')}_{run_root.name}"
+    suffix = 1
+    while trash_root.exists():
+        trash_root = APP_TMP_ROOT / f"{CLEARED_RUN_PREFIX}_{time.strftime('%Y%m%d_%H%M%S')}_{run_root.name}_{suffix}"
+        suffix += 1
+
+    try:
+        run_root.rename(trash_root)
+    except OSError as exc:
+        cleanup_warning = _empty_run_dir(run_root)
+        if cleanup_warning:
+            return run_root.name, f"Could not move stale cache aside ({exc}); {cleanup_warning}"
+        return run_root.name, f"Could not move stale cache aside ({exc}); cleared contents in place"
+
+    cleanup_error = None
+    for attempt in range(3):
+        try:
+            shutil.rmtree(trash_root)
+            return run_root.name, None
+        except OSError as exc:
+            cleanup_error = exc
+            time.sleep(0.1 * (attempt + 1))
+
+    return run_root.name, f"Moved stale cache to {trash_root}; cleanup failed: {cleanup_error}"
+
+
+def _empty_run_dir(run_root: Path):
+    cleanup_error = None
+    for attempt in range(3):
+        try:
+            for current_root, dirs, files in os.walk(run_root, topdown=False):
+                current_root = Path(current_root)
+                for filename in files:
+                    try:
+                        (current_root / filename).unlink()
+                    except OSError as exc:
+                        cleanup_error = exc
+                for dirname in dirs:
+                    try:
+                        (current_root / dirname).rmdir()
+                    except OSError as exc:
+                        cleanup_error = exc
+            try:
+                run_root.rmdir()
+                return None
+            except OSError as exc:
+                cleanup_error = exc
+            time.sleep(0.1 * (attempt + 1))
+        except OSError as exc:
+            cleanup_error = exc
+            time.sleep(0.1 * (attempt + 1))
+
+    return f"cleared cache contents in place but could not remove root {run_root}: {cleanup_error}"
 
 
 def _keyframe_summary(state):
     if state is None:
         return "No sequence loaded."
+    if state.get('prompt_mode') == 'Text concept':
+        text = str(state.get('concept_prompt') or '').strip()
+        return f"Text concept: {text}" if text else "No concept prompt yet."
     keyframes = sorted(int(idx) for idx, prompt_data in state.get("prompts_by_frame", {}).items() if prompt_data.get("points"))
     if not keyframes:
         return "No keyframes yet."
@@ -448,6 +661,26 @@ def _videomama_output_path(state, frame_idx):
     return Path(state['videomama_output_dir']) / f"{frame_stem}.png"
 
 
+def _resolve_videomama_output_dirs(run_root: Path, custom_output_dir: str):
+    custom_output_dir = str(custom_output_dir or '').strip()
+    if not custom_output_dir:
+        output_dir = run_root / 'videomama_frames'
+        return output_dir, run_root / 'alpha_frames'
+
+    output_dir = Path(custom_output_dir).expanduser()
+    if not output_dir.is_absolute():
+        output_dir = (REPO_ROOT / output_dir).resolve()
+    output_dir = output_dir.resolve()
+
+    if output_dir.name == 'videomama_frames':
+        alpha_dir = output_dir.parent / 'alpha_frames'
+    elif output_dir.name == 'alpha_frames':
+        raise gr.Error('Custom VideoMaMa output directory cannot be named alpha_frames.')
+    else:
+        alpha_dir = output_dir / 'alpha_frames'
+    return output_dir, alpha_dir
+
+
 def _load_current_mask(state, frame_idx):
     mask_path = _mask_output_path(state, frame_idx)
     if mask_path is not None and mask_path.exists():
@@ -463,6 +696,24 @@ def _load_current_mask(state, frame_idx):
 
 
 def _compute_preview_mask(state, frame_idx):
+    if state.get('prompt_mode') == 'Text concept':
+        text = str(state.get('concept_prompt') or '').strip()
+        preview_masks = state.setdefault('preview_masks', {})
+        if text and sam3_tracker is not None:
+            frame = _load_cached_frame(state, frame_idx)
+            mask = sam3_tracker.get_text_frame_mask(frame, text)
+            if not np.any(mask):
+                stats = getattr(sam3_tracker, 'last_text_prompt_stats', {}) or {}
+                raise gr.Error(
+                    f"SAM 3 found no mask pixels for `{text}` on this frame. "
+                    f"Mask count: {stats.get('mask_count', 0)}. "
+                    "Try a simpler noun phrase such as person, girl, hair, arm, or elbow."
+                )
+            preview_masks[str(frame_idx)] = mask.astype(np.uint8).tolist()
+            return mask
+        preview_masks.pop(str(frame_idx), None)
+        return None
+
     prompts = _prompt_data_for_frame(state, frame_idx)
     preview_masks = state.setdefault('preview_masks', {})
     if prompts['points'] and sam3_tracker is not None:
@@ -503,6 +754,7 @@ def _render_frame_preview(state, frame_idx):
 
 
 def _ui_state_payload(state, status_message):
+    _append_debug_line(status_message)
     preview, mask, output_preview = _render_frame_preview(state, state['current_frame_idx'])
     return (
         preview,
@@ -517,11 +769,15 @@ def _ui_state_payload(state, status_message):
         state.get('generated_masks_dir', ''),
         state.get('videomama_output_dir', ''),
         status_message,
+        _debug_console_text(),
     )
 
 
-def load_sequence(sequence_dir: str, exr_gamma: float, resume_from_tmp: bool = True):
+def load_sequence(sequence_dir: str, exr_gamma: float, resume_from_tmp: bool = True,
+                  prompt_mode: str = 'Point keyframes', concept_prompt: str = ''):
     exr_gamma = float(exr_gamma)
+    prompt_mode = str(prompt_mode or 'Point keyframes')
+    concept_prompt = str(concept_prompt or '').strip()
     frame_paths = _discover_sequence_files(sequence_dir)
     frame_names = [path.name for path in frame_paths]
     frame_sizes = [_image_size(str(path)) for path in frame_paths]
@@ -579,6 +835,8 @@ def load_sequence(sequence_dir: str, exr_gamma: float, resume_from_tmp: bool = T
         'current_frame_idx': 0,
         'prompts_by_frame': {},
         'preview_masks': {},
+        'prompt_mode': prompt_mode,
+        'concept_prompt': concept_prompt,
         'generated_masks_dir': None,
         'videomama_output_dir': None,
         'alpha_output_dir': None,
@@ -593,6 +851,10 @@ def load_sequence(sequence_dir: str, exr_gamma: float, resume_from_tmp: bool = T
         if prompts:
             state['prompts_by_frame'] = prompts
             restored.append(f"{len(prompts)} keyframe(s)")
+        restored_concept = _load_concept_prompt_from_run(run_root)
+        if restored_concept and not concept_prompt:
+            state['concept_prompt'] = restored_concept
+            restored.append('concept prompt')
 
         masks_dir = run_root / 'sam3_masks'
         first_stem = Path(frame_names[0]).stem
@@ -628,10 +890,11 @@ def load_sequence(sequence_dir: str, exr_gamma: float, resume_from_tmp: bool = T
     else:
         status_message = (
             f"Loaded {len(frame_paths)} frames from {sequence_dir}. "
-            "Click any frame to add keyframe prompts."
+            "Add point keyframes or enter a text concept, then generate SAM 3 masks."
         )
 
     preview, mask, output_preview = _render_frame_preview(state, 0)
+    _append_debug_line(status_message)
     return (
         preview,
         preview,
@@ -645,12 +908,14 @@ def load_sequence(sequence_dir: str, exr_gamma: float, resume_from_tmp: bool = T
         state.get('generated_masks_dir') or '',
         state.get('videomama_output_dir') or '',
         status_message,
+        _debug_console_text(),
     )
 
 
-def clear_sequence_cache_and_reload(state, sequence_dir: str, exr_gamma: float):
+def clear_sequence_cache_and_reload(state, sequence_dir: str, exr_gamma: float, prompt_mode: str, concept_prompt: str):
     """Delete this sequence's current app cache/run directory, then load fresh frames."""
     removed = []
+    cleanup_warnings = []
     candidate_roots = []
     if state and state.get('run_root'):
         candidate_roots.append(Path(state['run_root']))
@@ -668,17 +933,57 @@ def clear_sequence_cache_and_reload(state, sequence_dir: str, exr_gamma: float):
         run_root = Path(run_root)
         try:
             # Safety: only remove per-run directories anchored under APP_TMP_ROOT.
-            if run_root.exists() and run_root.parent == APP_TMP_ROOT and run_root.name != APP_TMP_ROOT.name:
-                shutil.rmtree(run_root)
-                removed.append(run_root.name)
+            removed_name, cleanup_warning = _clear_run_dir(run_root)
+            if removed_name:
+                removed.append(removed_name)
+            if cleanup_warning:
+                cleanup_warnings.append(cleanup_warning)
+                print(f"Warning: {cleanup_warning}")
         except OSError as exc:
             raise gr.Error(f"Could not clear sequence cache {run_root}: {exc}") from exc
 
     _free_cuda_cache()
-    payload = list(load_sequence(sequence_dir, exr_gamma, resume_from_tmp=False))
+    payload = list(load_sequence(sequence_dir, exr_gamma, resume_from_tmp=False,
+                                 prompt_mode=prompt_mode, concept_prompt=concept_prompt))
+    if len(payload) != UI_OUTPUT_COUNT:
+        raise gr.Error(f"Internal UI output mismatch: expected {UI_OUTPUT_COUNT}, got {len(payload)}")
     suffix = f" Cleared cache run(s): {', '.join(removed)}." if removed else " No prior cache run was found; loaded fresh."
-    payload[-1] = str(payload[-1]) + suffix
+    if cleanup_warnings:
+        suffix += " Deferred cleanup warning: " + " | ".join(cleanup_warnings)
+    payload[UI_OUTPUT_STATUS_INDEX] = str(payload[UI_OUTPUT_STATUS_INDEX]) + suffix
+    _append_debug_line(payload[UI_OUTPUT_STATUS_INDEX])
+    payload[UI_OUTPUT_DEBUG_INDEX] = _debug_console_text()
     return tuple(payload)
+
+
+def delete_tmp_data(state):
+    """Delete all production app tmp runs/settings, then clear the loaded UI state."""
+    try:
+        if APP_TMP_ROOT.exists():
+            shutil.rmtree(APP_TMP_ROOT)
+        APP_TMP_ROOT.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise gr.Error(f"Could not delete tmp data under {APP_TMP_ROOT}: {exc}") from exc
+
+    _free_cuda_cache()
+    blank = None
+    status_message = f"Deleted tmp data under {APP_TMP_ROOT}. Load a sequence to start fresh."
+    _append_debug_line(status_message)
+    return (
+        None,
+        None,
+        None,
+        None,
+        blank,
+        gr.update(minimum=0, maximum=0, value=0, interactive=False),
+        gr.update(minimum=0, maximum=0, value=0, interactive=False),
+        "No sequence loaded.",
+        "No keyframes yet.",
+        '',
+        '',
+        status_message,
+        _debug_console_text(),
+    )
 
 
 def select_frame(state, frame_index):
@@ -704,11 +1009,50 @@ def next_frame(state):
     return step_frame(state, 1)
 
 
-def add_point(state, point_mode, evt: gr.SelectData):
+def set_prompt_mode(state, prompt_mode, concept_prompt):
+    if state is None:
+        return "Load a sequence first."
+    state['prompt_mode'] = str(prompt_mode or 'Point keyframes')
+    state['concept_prompt'] = str(concept_prompt or '').strip()
+    state['preview_masks'] = {}
+    _invalidate_generated_results(state)
+    return _keyframe_summary(state)
+
+
+def update_concept_prompt(state, concept_prompt):
+    if state is None:
+        return "Load a sequence first."
+    state['concept_prompt'] = str(concept_prompt or '').strip()
+    state['preview_masks'] = {}
+    _invalidate_generated_results(state)
+    return _keyframe_summary(state)
+
+
+def preview_text_prompt_on_current_frame(state, prompt_mode, concept_prompt):
     if state is None:
         raise gr.Error('Load a sequence first.')
     if sam3_tracker is None:
         raise gr.Error('Initialize models first.')
+    if str(prompt_mode or '') != 'Text concept':
+        raise gr.Error('Switch Prompt Mode to Text concept before previewing a text prompt.')
+    text = str(concept_prompt or '').strip()
+    if not text:
+        raise gr.Error('Enter a concept prompt first.')
+    state['prompt_mode'] = 'Text concept'
+    state['concept_prompt'] = text
+    _compute_preview_mask(state, state['current_frame_idx'])
+    _invalidate_generated_results(state)
+    return _ui_state_payload(state, f"Previewed text concept `{text}` on current frame.")
+
+
+def add_point(state, prompt_mode, point_mode, evt: gr.SelectData):
+    if state is None:
+        raise gr.Error('Load a sequence first.')
+    if sam3_tracker is None:
+        raise gr.Error('Initialize models first.')
+    if str(prompt_mode or '') == 'Text concept':
+        raise gr.Error('Switch Prompt Mode to Point keyframes before adding points.')
+    state['prompt_mode'] = 'Point keyframes'
     if evt is None or evt.index is None:
         raise gr.Error('Click data was not received by Gradio.')
 
@@ -769,21 +1113,42 @@ def _normalized_prompt_dict(state):
     return prompts
 
 
-def generate_sam3_masks(state):
+def generate_sam3_masks(state, prompt_mode=None, concept_prompt=None):
     if state is None:
         raise gr.Error('Load a sequence first.')
-    if sam3_tracker is None:
-        raise gr.Error('Initialize models first.')
 
-    prompts = _normalized_prompt_dict(state)
+    _unload_videomama_pipeline()
+    import torch
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    tracker = _ensure_sam3_tracker(device)
+
+    if prompt_mode is not None:
+        state['prompt_mode'] = str(prompt_mode or 'Point keyframes')
+    if concept_prompt is not None and (str(concept_prompt or '').strip() or not state.get('concept_prompt')):
+        state['concept_prompt'] = str(concept_prompt or '').strip()
+
     run_root = Path(state['run_root'])
     mask_dir = run_root / 'sam3_masks'
     mask_dir.mkdir(parents=True, exist_ok=True)
 
-    with (run_root / 'keyframe_prompts.json').open('w', encoding='utf-8') as f:
-        json.dump({str(k): v for k, v in prompts.items()}, f, indent=2)
-
-    masks = sam3_tracker.track_video_from_dir(state['cache_dir'], prompts)
+    if state.get('prompt_mode') == 'Text concept':
+        text = str(state.get('concept_prompt') or '').strip()
+        if not text:
+            raise gr.Error('Enter a concept prompt first.')
+        with (run_root / 'concept_prompt.json').open('w', encoding='utf-8') as f:
+            json.dump({'text': text, 'frame_index': state['current_frame_idx']}, f, indent=2)
+        try:
+            masks = tracker.track_video_from_dir_with_text(
+                state['cache_dir'], text, frame_idx=state['current_frame_idx']
+            )
+        except ValueError as exc:
+            raise gr.Error(str(exc)) from exc
+    else:
+        prompts = _normalized_prompt_dict(state)
+        with (run_root / 'keyframe_prompts.json').open('w', encoding='utf-8') as f:
+            json.dump({str(k): v for k, v in prompts.items()}, f, indent=2)
+        masks = tracker.track_video_from_dir(state['cache_dir'], prompts)
 
     # SAM 3 propagation leaves a large block of cached VRAM behind. Release it so
     # the co-resident VideoMaMa matting pass has room on the same GPU.
@@ -817,14 +1182,23 @@ def _resolve_range(range_start, range_end, total_frames):
     return start, end
 
 
-def run_sequence(state, chunk_size, overlap, range_start=0, range_end=-1):
+def run_sequence(state, chunk_size, overlap, range_start=0, range_end=-1, custom_output_dir='',
+                 prompt_mode=None, concept_prompt=None):
     if state is None:
         raise gr.Error('Load a sequence first.')
-    if videomama_pipeline is None:
-        raise gr.Error('Initialize models first.')
+    if prompt_mode is not None:
+        state['prompt_mode'] = str(prompt_mode or 'Point keyframes')
+    if concept_prompt is not None and (str(concept_prompt or '').strip() or not state.get('concept_prompt')):
+        state['concept_prompt'] = str(concept_prompt or '').strip()
 
     if not state.get('generated_masks_dir'):
-        state = generate_sam3_masks(state)[3]
+        state = generate_sam3_masks(state)[4]
+
+    import torch
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    _unload_sam3_tracker()
+    pipeline = _ensure_videomama_pipeline(device)
 
     total_frames = len(state['frame_paths'])
     range_start, range_end = _resolve_range(range_start, range_end, total_frames)
@@ -837,8 +1211,7 @@ def run_sequence(state, chunk_size, overlap, range_start=0, range_end=-1):
     step = max(1, chunk_size - overlap)
 
     run_root = Path(state['run_root'])
-    output_dir = run_root / 'videomama_frames'
-    alpha_dir = run_root / 'alpha_frames'
+    output_dir, alpha_dir = _resolve_videomama_output_dirs(run_root, custom_output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     alpha_dir.mkdir(parents=True, exist_ok=True)
 
@@ -861,7 +1234,7 @@ def run_sequence(state, chunk_size, overlap, range_start=0, range_end=-1):
                 raise gr.Error(f"Missing SAM 3 mask for {frame_name}: {mask_path}")
             masks_np.append(np.array(Image.open(mask_path).convert('L')))
 
-        output_frames = videomama(videomama_pipeline, frames_np, masks_np)
+        output_frames = videomama(pipeline, frames_np, masks_np)
         # Keep every frame of the first chunk in this run; for later chunks drop the
         # leading `overlap` frames, which the previous chunk already wrote (the
         # overlap re-processes shared frames so segment boundaries blend cleanly).
@@ -898,100 +1271,149 @@ def run_sequence(state, chunk_size, overlap, range_start=0, range_end=-1):
 
 with gr.Blocks(title='VideoMaMa Production Sequence App', css=APP_CSS) as demo:
     gr.Markdown('# VideoMaMa Production Sequence App')
-    gr.Markdown('Load an EXR or image sequence, add SAM 3 prompts on multiple keyframes, generate the full mask track, then run VideoMaMa over the whole shot.')
-    gr.Markdown('Workflow: Initialize models, load the sequence, navigate frames, add prompts on the frames that need correction, generate SAM 3 masks, then run the whole sequence.')
 
     state = gr.State(None)
 
     _settings = _load_ui_settings()
 
-    with gr.Row():
-        sequence_dir = gr.Textbox(label='Sequence Directory', value=_settings['sequence_dir'])
-        exr_gamma = gr.Number(label='EXR Gamma', value=_settings['exr_gamma'], precision=2)
-        point_mode = gr.Radio(['Positive', 'Negative'], value=_settings['point_mode'], label='Point Mode')
+    status = gr.Textbox(label='Status', interactive=False)
 
     with gr.Row():
-        chunk_size = gr.Number(label='VideoMaMa Chunk Size', value=_settings['chunk_size'], precision=0)
-        overlap = gr.Number(label='Chunk Overlap', value=_settings['overlap'], precision=0)
-        resume_from_tmp = gr.Checkbox(
-            label='Resume from tmp (reuse cached frames, points, masks)',
-            value=_settings['resume_from_tmp'],
-        )
+        with gr.Column(scale=4, min_width=360):
+            with gr.Group():
+                sequence_dir = gr.Textbox(label='Sequence Directory', value=_settings['sequence_dir'])
+                with gr.Row():
+                    exr_gamma = gr.Number(label='EXR Gamma', value=_settings['exr_gamma'], precision=2)
+                    resume_from_tmp = gr.Checkbox(label='Resume from tmp', value=_settings['resume_from_tmp'])
+                with gr.Row():
+                    init_btn = gr.Button('Initialize Models', variant='primary')
+                    load_btn = gr.Button('Load Sequence', variant='primary')
+                with gr.Row():
+                    clear_cache_reload_btn = gr.Button('Clear Sequence Cache + Reload')
+                    delete_tmp_btn = gr.Button('Delete Tmp Data', elem_classes=['danger-button'])
 
-    with gr.Row():
-        range_start = gr.Number(label='Process Start Frame', value=_settings['range_start'], precision=0)
-        range_end = gr.Number(label='Process End Frame (-1 = last)', value=_settings['range_end'], precision=0)
+            with gr.Group():
+                prompt_mode = gr.Radio(
+                    ['Point keyframes', 'Text concept'],
+                    value=_settings['prompt_mode'],
+                    label='Prompt Mode',
+                )
+                concept_prompt = gr.Textbox(label='Concept Prompt', value=_settings['concept_prompt'])
+                point_mode = gr.Radio(['Positive', 'Negative'], value=_settings['point_mode'], label='Point Mode')
+                with gr.Row():
+                    undo_btn = gr.Button('Undo Point')
+                    clear_frame_btn = gr.Button('Clear Frame Points')
+                with gr.Row():
+                    clear_all_btn = gr.Button('Clear All Prompts')
+                    preview_text_btn = gr.Button('Preview Text Concept')
+                gen_masks_btn = gr.Button('Generate SAM 3 Masks', variant='primary')
+                keyframes_info = gr.Textbox(label='Prompt Summary', interactive=False)
 
-    with gr.Row():
-        init_btn = gr.Button('Initialize Models')
-        load_btn = gr.Button('Load Sequence')
-        clear_cache_reload_btn = gr.Button('Clear Sequence Cache + Reload')
-        prev_btn = gr.Button('Prev Frame')
-        next_btn = gr.Button('Next Frame')
-        undo_btn = gr.Button('Undo Point')
-        clear_frame_btn = gr.Button('Clear Frame Points')
-        clear_all_btn = gr.Button('Clear All Prompts')
-        gen_masks_btn = gr.Button('Generate SAM 3 Masks')
-        run_btn = gr.Button('Run VideoMaMa (Selected Range)')
+            with gr.Group():
+                with gr.Row():
+                    chunk_size = gr.Number(label='Chunk Size', value=_settings['chunk_size'], precision=0)
+                    overlap = gr.Number(label='Overlap', value=_settings['overlap'], precision=0)
+                with gr.Row():
+                    range_start = gr.Number(label='Start Frame', value=_settings['range_start'], precision=0)
+                    range_end = gr.Number(label='End Frame (-1 = last)', value=_settings['range_end'], precision=0)
+                custom_output_dir = gr.Textbox(
+                    label='Custom Output Directory',
+                    value=_settings['custom_output_dir'],
+                )
+                run_btn = gr.Button('Run VideoMaMa', variant='primary')
+                mask_dir = gr.Textbox(label='Mask Directory', interactive=False)
+                output_dir = gr.Textbox(label='VideoMaMa Output Directory', interactive=False)
 
-    frame_slider = gr.Slider(label='Current Frame', minimum=0, maximum=0, value=0, step=1, interactive=False)
-    frame_info = gr.Textbox(label='Frame Info')
-    keyframes_info = gr.Textbox(label='Keyframes')
+            with gr.Accordion('Debug Console', open=False):
+                debug_console = gr.Textbox(
+                    label='Console',
+                    value=_debug_console_text(),
+                    lines=18,
+                    max_lines=28,
+                    interactive=False,
+                    elem_classes=['debug-console'],
+                )
+                with gr.Row():
+                    refresh_debug_btn = gr.Button('Refresh Console')
+                    clear_debug_btn = gr.Button('Clear Console')
 
-    with gr.Row():
-        preview = gr.Image(
-            label='Sequence Preview / Prompt Overlay',
-            type='numpy',
-            interactive=False,
-            sources=[],
-            show_download_button=False,
-            show_fullscreen_button=True,
-            elem_classes=['accurate-preview'],
-        )
-        mask_img = gr.Image(label='Current SAM 3 Mask', type='numpy', elem_classes=['accurate-preview'])
-        output_img = gr.Image(label='Current VideoMaMa Output', type='numpy', elem_classes=['accurate-preview'])
+        with gr.Column(scale=7, min_width=560):
+            frame_slider = gr.Slider(label='Current Frame', minimum=0, maximum=0, value=0, step=1, interactive=False)
+            with gr.Row():
+                prev_btn = gr.Button('Prev Frame')
+                next_btn = gr.Button('Next Frame')
+            frame_info = gr.Textbox(label='Frame Info', interactive=False)
 
-    with gr.Accordion('Large Accurate Prompt View (scrub and click here for precise points)', open=False):
-        gr.Markdown('This large view uses the same letterboxed SAM working frame, so click coordinates match the mask tracker. Use the fullscreen icon for maximum precision.')
-        large_frame_slider = gr.Slider(label='Large View Current Frame', minimum=0, maximum=0, value=0, step=1, interactive=False)
-        preview_large = gr.Image(
-            label='Large Sequence Preview / Prompt Overlay',
-            type='numpy',
-            interactive=False,
-            sources=[],
-            height=720,
-            show_download_button=False,
-            show_fullscreen_button=True,
-            elem_id='large_prompt_preview',
-            elem_classes=['accurate-preview'],
-        )
-
-    mask_dir = gr.Textbox(label='Saved Mask Directory')
-    output_dir = gr.Textbox(label='Saved VideoMaMa Output Directory')
-    status = gr.Textbox(label='Status')
+            with gr.Tabs():
+                with gr.Tab('Review'):
+                    preview = gr.Image(
+                        label='Prompt Overlay',
+                        type='numpy',
+                        interactive=False,
+                        sources=[],
+                        height=600,
+                        show_download_button=False,
+                        show_fullscreen_button=True,
+                        elem_classes=['accurate-preview'],
+                    )
+                with gr.Tab('Mask'):
+                    mask_img = gr.Image(label='Current SAM 3 Mask', type='numpy', height=600, elem_classes=['accurate-preview'])
+                with gr.Tab('VideoMaMa'):
+                    output_img = gr.Image(label='Current VideoMaMa Output', type='numpy', height=600, elem_classes=['accurate-preview'])
+                with gr.Tab('Large Prompt'):
+                    large_frame_slider = gr.Slider(label='Large View Frame', minimum=0, maximum=0, value=0, step=1, interactive=False)
+                    preview_large = gr.Image(
+                        label='Large Prompt Overlay',
+                        type='numpy',
+                        interactive=False,
+                        sources=[],
+                        height=720,
+                        show_download_button=False,
+                        show_fullscreen_button=True,
+                        elem_id='large_prompt_preview',
+                        elem_classes=['accurate-preview'],
+                    )
 
     ui_outputs = [
         preview, preview_large, mask_img, output_img, state, frame_slider, large_frame_slider,
-        frame_info, keyframes_info, mask_dir, output_dir, status,
+        frame_info, keyframes_info, mask_dir, output_dir, status, debug_console,
     ]
 
     # Persist the input panel whenever any setting changes, so the next launch
     # restores the same session configuration.
-    settings_inputs = [sequence_dir, exr_gamma, point_mode, chunk_size, overlap, resume_from_tmp,
+    settings_inputs = [sequence_dir, exr_gamma, prompt_mode, concept_prompt, point_mode, chunk_size, overlap,
+                       custom_output_dir, resume_from_tmp,
                        range_start, range_end]
     for _component in settings_inputs:
         _component.change(_save_ui_settings, inputs=settings_inputs, outputs=None)
 
-    init_btn.click(initialize_models, outputs=status)
+    init_btn.click(initialize_models, outputs=[status, debug_console])
+    refresh_debug_btn.click(refresh_debug_console, outputs=debug_console)
+    clear_debug_btn.click(clear_debug_console, outputs=debug_console)
     load_btn.click(
         load_sequence,
-        inputs=[sequence_dir, exr_gamma, resume_from_tmp],
+        inputs=[sequence_dir, exr_gamma, resume_from_tmp, prompt_mode, concept_prompt],
         outputs=ui_outputs,
     )
     clear_cache_reload_btn.click(
         clear_sequence_cache_and_reload,
-        inputs=[state, sequence_dir, exr_gamma],
+        inputs=[state, sequence_dir, exr_gamma, prompt_mode, concept_prompt],
         outputs=ui_outputs,
+    )
+    delete_tmp_btn.click(
+        delete_tmp_data,
+        inputs=state,
+        outputs=ui_outputs,
+    )
+    prompt_mode.change(
+        set_prompt_mode,
+        inputs=[state, prompt_mode, concept_prompt],
+        outputs=keyframes_info,
+    )
+    concept_prompt.change(
+        update_concept_prompt,
+        inputs=[state, concept_prompt],
+        outputs=keyframes_info,
     )
     frame_slider.release(
         select_frame,
@@ -1015,12 +1437,12 @@ with gr.Blocks(title='VideoMaMa Production Sequence App', css=APP_CSS) as demo:
     )
     preview.select(
         add_point,
-        inputs=[state, point_mode],
+        inputs=[state, prompt_mode, point_mode],
         outputs=ui_outputs,
     )
     preview_large.select(
         add_point,
-        inputs=[state, point_mode],
+        inputs=[state, prompt_mode, point_mode],
         outputs=ui_outputs,
     )
     undo_btn.click(
@@ -1038,14 +1460,19 @@ with gr.Blocks(title='VideoMaMa Production Sequence App', css=APP_CSS) as demo:
         inputs=state,
         outputs=ui_outputs,
     )
+    preview_text_btn.click(
+        preview_text_prompt_on_current_frame,
+        inputs=[state, prompt_mode, concept_prompt],
+        outputs=ui_outputs,
+    )
     gen_masks_btn.click(
         generate_sam3_masks,
-        inputs=state,
+        inputs=[state, prompt_mode, concept_prompt],
         outputs=ui_outputs,
     )
     run_btn.click(
         run_sequence,
-        inputs=[state, chunk_size, overlap, range_start, range_end],
+        inputs=[state, chunk_size, overlap, range_start, range_end, custom_output_dir, prompt_mode, concept_prompt],
         outputs=ui_outputs,
     )
 

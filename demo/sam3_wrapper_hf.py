@@ -89,6 +89,7 @@ class SAM3VideoTracker:
             kwargs["gpus_to_use"] = gpus_to_use
         kwargs["version"] = model_version
         self.predictor = build_sam3_predictor(**kwargs)
+        self.last_text_prompt_stats = {}
         print(f"SAM 3 video predictor initialized on {device}")
 
     def _normalize_prompts_by_frame(self, prompts_by_frame: Dict[int, Dict[str, List[List[int]]]]):
@@ -143,6 +144,47 @@ class SAM3VideoTracker:
             return mask.astype(np.uint8)
         return ((mask > 0) * 255).astype(np.uint8)
 
+    def _extract_combined_mask(self, outputs, frame_shape):
+        height, width = frame_shape
+        if not outputs:
+            return np.zeros((height, width), dtype=np.uint8)
+
+        masks = outputs.get("out_binary_masks")
+        if masks is None or len(masks) == 0:
+            return np.zeros((height, width), dtype=np.uint8)
+
+        combined = np.zeros((height, width), dtype=bool)
+        for mask in masks:
+            if hasattr(mask, "detach"):
+                mask = mask.detach().cpu().numpy()
+            mask = np.asarray(mask).squeeze()
+            if mask.shape != (height, width):
+                mask = np.array(
+                    Image.fromarray((mask > 0).astype(np.uint8) * 255).resize(
+                        (width, height), Image.Resampling.NEAREST
+                    )
+                )
+            combined |= mask > 0
+        return (combined.astype(np.uint8) * 255)
+
+    def _output_mask_stats(self, outputs):
+        if not outputs:
+            return {"mask_count": 0, "areas": [], "keys": []}
+        masks = outputs.get("out_binary_masks")
+        if masks is None:
+            return {"mask_count": 0, "areas": [], "keys": sorted(outputs.keys())}
+        areas = []
+        for mask in masks:
+            if hasattr(mask, "detach"):
+                mask = mask.detach().cpu().numpy()
+            mask = np.asarray(mask).squeeze()
+            areas.append(int((mask > 0).sum()))
+        return {
+            "mask_count": len(areas),
+            "areas": areas,
+            "keys": sorted(outputs.keys()),
+        }
+
     def _start_session(self, frames_dir: str):
         response = self.predictor.handle_request(
             request={
@@ -179,6 +221,31 @@ class SAM3VideoTracker:
             }
         )
 
+    def _add_text_prompt(self, session_id: str, frame_idx: int, text: str):
+        text = str(text or "").strip()
+        if not text:
+            raise ValueError("A non-empty text prompt is required.")
+        response = self.predictor.handle_request(
+            request={
+                "type": "add_prompt",
+                "session_id": session_id,
+                "frame_index": int(frame_idx),
+                "text": text,
+            }
+        )
+        stats = self._output_mask_stats(response.get("outputs", {}))
+        self.last_text_prompt_stats = {
+            "text": text,
+            "frame_index": int(frame_idx),
+            **stats,
+        }
+        print(
+            "SAM 3 text prompt "
+            f"`{text}` on frame {frame_idx}: {stats['mask_count']} mask(s), "
+            f"areas={stats['areas'][:8]}, keys={stats['keys']}"
+        )
+        return response
+
     def track_video_from_dir(self, frames_dir: str, prompts_by_frame, obj_id: int = 1) -> List[np.ndarray]:
         prompts_by_frame = self._normalize_prompts_by_frame(prompts_by_frame)
         height, width, num_frames = self._frame_shape_from_dir(frames_dir)
@@ -213,7 +280,14 @@ class SAM3VideoTracker:
                     request={
                         "type": "propagate_in_video",
                         "session_id": session_id,
+                        # Point prompts are stored in the interactive tracker state,
+                        # not in SAM 3's VG `previous_stages_out`. If this is left
+                        # unset, SAM 3 checks only `previous_stages_out` and raises
+                        # "No prompts are received" even though point prompts were
+                        # accepted. Start from the earliest prompted keyframe and
+                        # let bidirectional propagation cover the shot.
                         "start_frame_index": keyframes[0],
+                        "propagation_direction": "both",
                     }
                 ):
                     frame_idx = int(response["frame_index"])
@@ -221,7 +295,57 @@ class SAM3VideoTracker:
         finally:
             self._close_session(session_id)
 
-        print(f"Generated {len(final_masks)} SAM 3 masks from {len(keyframes)} keyframes")
+        frames_with_pixels = sum(1 for mask in final_masks if np.any(mask))
+        total_pixels = int(sum((mask > 0).sum() for mask in final_masks))
+        print(
+            f"Generated {len(final_masks)} SAM 3 masks from {len(keyframes)} keyframes; "
+            f"frames_with_pixels={frames_with_pixels}/{num_frames}, total_pixels={total_pixels}"
+        )
+        return final_masks
+
+    def track_video_from_dir_with_text(self, frames_dir: str, text: str, frame_idx: int = 0) -> List[np.ndarray]:
+        height, width, num_frames = self._frame_shape_from_dir(frames_dir)
+        frame_idx = max(0, min(int(frame_idx), num_frames - 1))
+
+        session_id = self._start_session(frames_dir)
+        try:
+            response = self._add_text_prompt(session_id, frame_idx, text)
+            final_masks = [np.zeros((height, width), dtype=np.uint8) for _ in range(num_frames)]
+            final_masks[frame_idx] = self._extract_combined_mask(response.get("outputs", {}), (height, width))
+
+            import torch
+
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                for response in self.predictor.handle_stream_request(
+                    request={
+                        "type": "propagate_in_video",
+                        "session_id": session_id,
+                        "start_frame_index": 0,
+                    }
+                ):
+                    out_frame_idx = int(response["frame_index"])
+                    final_masks[out_frame_idx] = self._extract_combined_mask(
+                        response.get("outputs", {}), (height, width)
+                    )
+        finally:
+            self._close_session(session_id)
+
+        frames_with_pixels = sum(1 for mask in final_masks if np.any(mask))
+        total_pixels = int(sum((mask > 0).sum() for mask in final_masks))
+        self.last_text_prompt_stats.update(
+            {
+                "frames_with_pixels": int(frames_with_pixels),
+                "total_pixels": total_pixels,
+                "num_frames": int(num_frames),
+            }
+        )
+        if total_pixels == 0:
+            raise ValueError(
+                f"SAM 3 returned no mask pixels for text prompt `{text}`. "
+                "Try a simpler noun phrase such as `person`, `girl`, `hair`, or `arm`."
+            )
+
+        print(f"Generated {len(final_masks)} SAM 3 masks from text prompt `{text}`")
         return final_masks
 
     def track_video_with_keyframes(self, frames: List[np.ndarray], prompts_by_frame, obj_id: int = 1) -> List[np.ndarray]:
@@ -260,6 +384,22 @@ class SAM3VideoTracker:
                     obj_id=1,
                 )
                 return self._extract_mask(response.get("outputs", {}), (height, width), obj_id=1)
+            finally:
+                self._close_session(session_id)
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+    def get_text_frame_mask(self, frame: np.ndarray, text: str) -> np.ndarray:
+        height, width = frame.shape[:2]
+        temp_dir = Path(tempfile.mkdtemp())
+        frames_dir = temp_dir / "frames"
+        frames_dir.mkdir(exist_ok=True)
+        try:
+            Image.fromarray(frame).save(frames_dir / "00000.jpg", quality=95)
+            session_id = self._start_session(str(frames_dir))
+            try:
+                response = self._add_text_prompt(session_id, 0, text)
+                return self._extract_combined_mask(response.get("outputs", {}), (height, width))
             finally:
                 self._close_session(session_id)
         finally:

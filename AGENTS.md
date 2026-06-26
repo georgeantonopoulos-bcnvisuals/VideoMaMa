@@ -216,6 +216,18 @@ printf '%s\n' "$VIDEOMAMA_CHECKPOINTS" "$VIDEOMAMA_BASE_MODEL_PATH" "$VIDEOMAMA_
 
 Starting the UI or running inference can require GPU access and large checkpoints. Do not assume those are available in every coding session.
 
+### UI Regression Verification
+
+- When fixing a production UI button, reproduce the failure against the actual
+  loaded session/run path whenever the user reports one. Synthetic smoke tests are
+  useful only after the real path has been exercised or the real failure has been
+  encoded as a regression test.
+- For "Clear Sequence Cache + Reload", verify the current `state['run_root']`
+  directory is actually removed or moved aside on disk, and confirm the button
+  reloads without resuming the stale cache. Network-mounted tmp directories may
+  raise `OSError: [Errno 39] Directory not empty` during deletion; tests should
+  cover that exact failure mode.
+
 ## Deployment Notes
 
 - 2026-06-15: For shared studio use, prefer a private service rather than Gradio share: run the production UI on a G6 GPU host behind VPN/private ALB or reverse proxy with studio SSO/basic auth, mount shared storage/checkpoints, and serialize GPU jobs until a real queue/worker layer exists.
