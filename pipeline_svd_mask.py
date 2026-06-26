@@ -953,7 +953,7 @@ class VideoInferencePipeline:
                 frames.append(decoded_chunk)
 
             video_tensor = torch.cat(frames, dim=0)
-            video_tensor = (video_tensor / 2.0 + 0.5).clamp(0, 1).mean(dim=1, keepdim=True).repeat(1, 3, 1, 1)
+            video_tensor = (video_tensor / 2.0 + 0.5).clamp(0, 1).mean(dim=1, keepdim=True).repeat(1, 3, 1, 1).float()
 
             # Return a list of PIL images
             return [transforms.ToPILImage()(frame) for frame in video_tensor]
