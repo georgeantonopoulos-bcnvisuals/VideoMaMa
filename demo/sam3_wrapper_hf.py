@@ -205,7 +205,16 @@ class SAM3VideoTracker:
         except Exception as exc:
             print(f"Warning: failed to close SAM 3 session {session_id}: {exc}")
 
-    def _add_prompt(self, session_id: str, frame_idx: int, prompt_data, width: int, height: int, obj_id: int):
+    def _add_prompt(
+        self,
+        session_id: str,
+        frame_idx: int,
+        prompt_data,
+        width: int,
+        height: int,
+        obj_id: int,
+        output_prob_thresh: float = 0.5,
+    ):
         import torch
 
         points = self._relative_points(prompt_data["points"], width, height)
@@ -218,10 +227,11 @@ class SAM3VideoTracker:
                 "points": torch.tensor(points, dtype=torch.float32),
                 "point_labels": torch.tensor(labels, dtype=torch.int32),
                 "obj_id": int(obj_id),
+                "output_prob_thresh": float(output_prob_thresh),
             }
         )
 
-    def _add_text_prompt(self, session_id: str, frame_idx: int, text: str):
+    def _add_text_prompt(self, session_id: str, frame_idx: int, text: str, output_prob_thresh: float = 0.5):
         text = str(text or "").strip()
         if not text:
             raise ValueError("A non-empty text prompt is required.")
@@ -231,12 +241,14 @@ class SAM3VideoTracker:
                 "session_id": session_id,
                 "frame_index": int(frame_idx),
                 "text": text,
+                "output_prob_thresh": float(output_prob_thresh),
             }
         )
         stats = self._output_mask_stats(response.get("outputs", {}))
         self.last_text_prompt_stats = {
             "text": text,
             "frame_index": int(frame_idx),
+            "output_prob_thresh": float(output_prob_thresh),
             **stats,
         }
         print(
@@ -246,7 +258,13 @@ class SAM3VideoTracker:
         )
         return response
 
-    def track_video_from_dir(self, frames_dir: str, prompts_by_frame, obj_id: int = 1) -> List[np.ndarray]:
+    def track_video_from_dir(
+        self,
+        frames_dir: str,
+        prompts_by_frame,
+        obj_id: int = 1,
+        output_prob_thresh: float = 0.5,
+    ) -> List[np.ndarray]:
         prompts_by_frame = self._normalize_prompts_by_frame(prompts_by_frame)
         height, width, num_frames = self._frame_shape_from_dir(frames_dir)
         keyframes = sorted(prompts_by_frame)
@@ -257,7 +275,15 @@ class SAM3VideoTracker:
         try:
             latest_outputs = {}
             for frame_idx, prompt_data in prompts_by_frame.items():
-                response = self._add_prompt(session_id, frame_idx, prompt_data, width, height, obj_id=obj_id)
+                response = self._add_prompt(
+                    session_id,
+                    frame_idx,
+                    prompt_data,
+                    width,
+                    height,
+                    obj_id=obj_id,
+                    output_prob_thresh=output_prob_thresh,
+                )
                 latest_outputs[frame_idx] = response.get("outputs", {})
 
             final_masks = [np.zeros((height, width), dtype=np.uint8) for _ in range(num_frames)]
@@ -288,6 +314,7 @@ class SAM3VideoTracker:
                         # let bidirectional propagation cover the shot.
                         "start_frame_index": keyframes[0],
                         "propagation_direction": "both",
+                        "output_prob_thresh": float(output_prob_thresh),
                     }
                 ):
                     frame_idx = int(response["frame_index"])
@@ -299,17 +326,24 @@ class SAM3VideoTracker:
         total_pixels = int(sum((mask > 0).sum() for mask in final_masks))
         print(
             f"Generated {len(final_masks)} SAM 3 masks from {len(keyframes)} keyframes; "
-            f"frames_with_pixels={frames_with_pixels}/{num_frames}, total_pixels={total_pixels}"
+            f"frames_with_pixels={frames_with_pixels}/{num_frames}, total_pixels={total_pixels}, "
+            f"output_prob_thresh={float(output_prob_thresh):.3f}"
         )
         return final_masks
 
-    def track_video_from_dir_with_text(self, frames_dir: str, text: str, frame_idx: int = 0) -> List[np.ndarray]:
+    def track_video_from_dir_with_text(
+        self,
+        frames_dir: str,
+        text: str,
+        frame_idx: int = 0,
+        output_prob_thresh: float = 0.5,
+    ) -> List[np.ndarray]:
         height, width, num_frames = self._frame_shape_from_dir(frames_dir)
         frame_idx = max(0, min(int(frame_idx), num_frames - 1))
 
         session_id = self._start_session(frames_dir)
         try:
-            response = self._add_text_prompt(session_id, frame_idx, text)
+            response = self._add_text_prompt(session_id, frame_idx, text, output_prob_thresh=output_prob_thresh)
             final_masks = [np.zeros((height, width), dtype=np.uint8) for _ in range(num_frames)]
             final_masks[frame_idx] = self._extract_combined_mask(response.get("outputs", {}), (height, width))
 
@@ -320,7 +354,9 @@ class SAM3VideoTracker:
                     request={
                         "type": "propagate_in_video",
                         "session_id": session_id,
-                        "start_frame_index": 0,
+                        "start_frame_index": frame_idx,
+                        "propagation_direction": "both",
+                        "output_prob_thresh": float(output_prob_thresh),
                     }
                 ):
                     out_frame_idx = int(response["frame_index"])
@@ -337,6 +373,7 @@ class SAM3VideoTracker:
                 "frames_with_pixels": int(frames_with_pixels),
                 "total_pixels": total_pixels,
                 "num_frames": int(num_frames),
+                "output_prob_thresh": float(output_prob_thresh),
             }
         )
         if total_pixels == 0:
@@ -345,28 +382,55 @@ class SAM3VideoTracker:
                 "Try a simpler noun phrase such as `person`, `girl`, `hair`, or `arm`."
             )
 
-        print(f"Generated {len(final_masks)} SAM 3 masks from text prompt `{text}`")
+        print(
+            f"Generated {len(final_masks)} SAM 3 masks from text prompt `{text}` "
+            f"with output_prob_thresh={float(output_prob_thresh):.3f}"
+        )
         return final_masks
 
-    def track_video_with_keyframes(self, frames: List[np.ndarray], prompts_by_frame, obj_id: int = 1) -> List[np.ndarray]:
+    def track_video_with_keyframes(
+        self,
+        frames: List[np.ndarray],
+        prompts_by_frame,
+        obj_id: int = 1,
+        output_prob_thresh: float = 0.5,
+    ) -> List[np.ndarray]:
         temp_dir = Path(tempfile.mkdtemp())
         frames_dir = temp_dir / "frames"
         frames_dir.mkdir(exist_ok=True)
         try:
             for i, frame in enumerate(frames):
                 Image.fromarray(frame).save(frames_dir / f"{i:05d}.jpg", quality=95)
-            return self.track_video_from_dir(str(frames_dir), prompts_by_frame, obj_id=obj_id)
+            return self.track_video_from_dir(
+                str(frames_dir),
+                prompts_by_frame,
+                obj_id=obj_id,
+                output_prob_thresh=output_prob_thresh,
+            )
         finally:
             shutil.rmtree(temp_dir, ignore_errors=True)
 
-    def track_video(self, frames: List[np.ndarray], points: List[List[int]], labels: List[int]) -> List[np.ndarray]:
+    def track_video(
+        self,
+        frames: List[np.ndarray],
+        points: List[List[int]],
+        labels: List[int],
+        output_prob_thresh: float = 0.5,
+    ) -> List[np.ndarray]:
         return self.track_video_with_keyframes(
             frames,
             {0: {"points": points, "labels": labels}},
             obj_id=1,
+            output_prob_thresh=output_prob_thresh,
         )
 
-    def get_frame_mask(self, frame: np.ndarray, points: List[List[int]], labels: List[int]) -> np.ndarray:
+    def get_frame_mask(
+        self,
+        frame: np.ndarray,
+        points: List[List[int]],
+        labels: List[int],
+        output_prob_thresh: float = 0.5,
+    ) -> np.ndarray:
         height, width = frame.shape[:2]
         temp_dir = Path(tempfile.mkdtemp())
         frames_dir = temp_dir / "frames"
@@ -382,6 +446,7 @@ class SAM3VideoTracker:
                     width,
                     height,
                     obj_id=1,
+                    output_prob_thresh=output_prob_thresh,
                 )
                 return self._extract_mask(response.get("outputs", {}), (height, width), obj_id=1)
             finally:
@@ -389,7 +454,7 @@ class SAM3VideoTracker:
         finally:
             shutil.rmtree(temp_dir, ignore_errors=True)
 
-    def get_text_frame_mask(self, frame: np.ndarray, text: str) -> np.ndarray:
+    def get_text_frame_mask(self, frame: np.ndarray, text: str, output_prob_thresh: float = 0.5) -> np.ndarray:
         height, width = frame.shape[:2]
         temp_dir = Path(tempfile.mkdtemp())
         frames_dir = temp_dir / "frames"
@@ -398,15 +463,21 @@ class SAM3VideoTracker:
             Image.fromarray(frame).save(frames_dir / "00000.jpg", quality=95)
             session_id = self._start_session(str(frames_dir))
             try:
-                response = self._add_text_prompt(session_id, 0, text)
+                response = self._add_text_prompt(session_id, 0, text, output_prob_thresh=output_prob_thresh)
                 return self._extract_combined_mask(response.get("outputs", {}), (height, width))
             finally:
                 self._close_session(session_id)
         finally:
             shutil.rmtree(temp_dir, ignore_errors=True)
 
-    def get_first_frame_mask(self, frame: np.ndarray, points: List[List[int]], labels: List[int]) -> np.ndarray:
-        return self.get_frame_mask(frame, points, labels)
+    def get_first_frame_mask(
+        self,
+        frame: np.ndarray,
+        points: List[List[int]],
+        labels: List[int],
+        output_prob_thresh: float = 0.5,
+    ) -> np.ndarray:
+        return self.get_frame_mask(frame, points, labels, output_prob_thresh=output_prob_thresh)
 
 
 def load_sam3_tracker(device="cuda", model_version="sam3"):
