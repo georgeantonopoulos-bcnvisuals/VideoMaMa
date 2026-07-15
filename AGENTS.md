@@ -62,6 +62,11 @@ with `/tmp/videomama-sam3-ui-venv/bin/hf auth login`, and the token must have
 accepted access to `facebook/sam3` or `facebook/sam3.1`. Override the default
 with `SAM3_MODEL_VERSION=sam3.1` when launching.
 
+The first SAM 3 Git commit resolved by the bootstrap is recorded in
+`tmp/runtime-locks/sam3-requirement.txt` and reused for later `/tmp` venv
+rebuilds. Set `REFRESH_SAM3_LOCK=1` (and optionally `SAM3_GIT_REF=<ref>`) when
+intentionally updating SAM 3.
+
 Launch the production SAM 3 + VideoMaMa UI:
 
 ```bash
@@ -115,6 +120,12 @@ If you still OOM, lower the UI "VideoMaMa Chunk Size" (default 16) and/or
 6. Saves masks under `sam3_masks`.
 7. Runs VideoMaMa in chunks with configurable overlap.
 8. Saves outputs under `videomama_frames` and grayscale alpha previews under `alpha_frames`.
+
+Each run also writes `run_manifest.json` with source fingerprints, SAM prompt
+provenance, VideoMaMa settings, per-frame completion records, and failure state.
+VideoMaMa preview PNGs remain 8-bit for the UI; `alpha_frames` supports 16-bit
+PNG, half-float EXR, or both. EXR model-input conversion supports gamma and
+exposure controls.
 
 The production app supports `.exr`, `.png`, `.jpg`, `.jpeg`, `.tif`, and `.tiff` inputs. EXR RGB conversion uses `OpenEXR`/`Imath`, `exr_gamma`, and exposure handling in code.
 
@@ -171,7 +182,8 @@ The CLI supports EXR input and mask channel selection. See `inference.md` for fl
 
 - `scripts/requirements-inference.txt` is the Python 3.9 inference dependency set.
 - `scripts/requirements-sam3-ui.txt` is the Python 3.12 production UI dependency set and installs SAM 3 from GitHub.
-- Torch is installed separately by `scripts/bootstrap_tmp_venv.sh` from the CUDA 12.4 wheel index.
+- Torch is installed separately by `scripts/bootstrap_tmp_venv.sh`: CUDA 12.4
+  wheels for the Python 3.9 inference venv and CUDA 12.8 wheels for the SAM 3 UI venv.
 - `setup.py` contains the broader upstream/training dependency list and includes heavy training dependencies such as `deepspeed` and `flash_attn`.
 
 Avoid mixing the UI and inference venv assumptions unless you are explicitly changing the runtime layout.
@@ -197,7 +209,8 @@ Avoid mixing the UI and inference venv assumptions unless you are explicitly cha
 - Be careful with `demo/sam2_wrapper.py` and `demo/sam2_wrapper_hf.py`: these are older SAM2 wrappers. The production app imports `sam3_wrapper_hf.py`.
 - Generated app outputs belong under `tmp/production_sequence_app/` and should not be treated as source.
 - Checkpoint directories can be very large; do not vendor weights into the repo.
-- Preserve the 1024x576 working size unless you also audit VideoMaMa assumptions in the wrappers and pipeline.
+- 1024x576 remains the production default. Higher 16:9 working resolutions are
+  experimental and must remain divisible by 8; audit VRAM and matte quality when changing them.
 
 ## Useful Checks
 

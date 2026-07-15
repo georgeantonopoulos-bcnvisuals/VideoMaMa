@@ -131,7 +131,11 @@ build_inference_venv() {
   log "Building inference venv at ${INFER_VENV} (Python: ${PYTHON_INFER_BIN})"
   check_python "${PYTHON_INFER_BIN}" "infer"
 
-  if [[ ! -d "${INFER_VENV}" ]]; then
+  if [[ -d "${INFER_VENV}" && ! -x "${INFER_VENV}/bin/python" ]]; then
+    log "Removing incomplete inference venv: ${INFER_VENV}"
+    rm -rf "${INFER_VENV}"
+  fi
+  if [[ ! -x "${INFER_VENV}/bin/python" ]]; then
     "${PYTHON_INFER_BIN}" -m venv "${INFER_VENV}"
   fi
   # shellcheck disable=SC1091
@@ -140,6 +144,8 @@ build_inference_venv() {
   python -m pip install --index-url "${INFER_TORCH_INDEX_URL}" \
       torch==2.4.0 torchvision==0.19.0 torchaudio==2.4.0
   python -m pip install -r "${REPO_ROOT}/scripts/requirements-inference.txt"
+  mkdir -p "${REPO_ROOT}/tmp/runtime-locks"
+  python -m pip freeze > "${REPO_ROOT}/tmp/runtime-locks/requirements-inference.lock.txt"
   deactivate
   log "Inference venv ready."
 }
@@ -149,7 +155,11 @@ build_ui_venv() {
   log "Building SAM 3 UI venv at ${UI_VENV} (Python: ${PYTHON_UI_BIN})"
   check_python "${PYTHON_UI_BIN}" "ui"
 
-  if [[ ! -d "${UI_VENV}" ]]; then
+  if [[ -d "${UI_VENV}" && ! -x "${UI_VENV}/bin/python" ]]; then
+    log "Removing incomplete SAM 3 UI venv: ${UI_VENV}"
+    rm -rf "${UI_VENV}"
+  fi
+  if [[ ! -x "${UI_VENV}/bin/python" ]]; then
     "${PYTHON_UI_BIN}" -m venv "${UI_VENV}"
   fi
   # shellcheck disable=SC1091
@@ -158,8 +168,23 @@ build_ui_venv() {
   # Keep the generic bootstrap upgrade from fighting that pin on every run.
   python -m pip install --upgrade pip wheel
   python -m pip install --index-url "${UI_TORCH_INDEX_URL}" \
-      torch==2.10.0 torchvision torchaudio
+      torch==2.10.0 torchvision==0.25.0 torchaudio==2.10.0
   python -m pip install -r "${REPO_ROOT}/scripts/requirements-sam3-ui.txt"
+  mkdir -p "${REPO_ROOT}/tmp/runtime-locks"
+  local sam3_lock="${REPO_ROOT}/tmp/runtime-locks/sam3-requirement.txt"
+  if [[ -s "${sam3_lock}" && "${REFRESH_SAM3_LOCK:-0}" != "1" ]]; then
+    log "Installing the previously resolved SAM 3 commit from ${sam3_lock}"
+    python -m pip install -r "${sam3_lock}"
+  else
+    local sam3_ref="${SAM3_GIT_REF:-main}"
+    log "Installing SAM 3 from Git ref ${sam3_ref}"
+    python -m pip install "git+https://github.com/facebookresearch/sam3.git@${sam3_ref}"
+    python -m pip freeze | awk '/^sam3 @ git\+https:\/\/github.com\/facebookresearch\/sam3.git@/ { print; exit }' > "${sam3_lock}"
+    if [[ ! -s "${sam3_lock}" ]]; then
+      log "WARNING: could not record the resolved SAM 3 Git commit; the full environment lock is still available."
+    fi
+  fi
+  python -m pip freeze > "${REPO_ROOT}/tmp/runtime-locks/requirements-sam3-ui.lock.txt"
   deactivate
   log "SAM 3 UI venv ready."
 }

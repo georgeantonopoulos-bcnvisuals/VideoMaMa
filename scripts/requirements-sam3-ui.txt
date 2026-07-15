@@ -2,16 +2,17 @@
 # Torch must come from the CUDA index; installed separately by bootstrap.
 # SAM 3 currently imports pkg_resources, which was removed from setuptools 82+.
 setuptools<82
-diffusers>=0.31.0
-transformers>=4.57.0
-accelerate>=1.9.0
-einops>=0.8.0
-opencv-python-headless>=4.10.0
-Pillow>=10.0.0
-numpy
+diffusers==0.31.0
+transformers==4.57.0
+accelerate==1.9.0
+einops==0.8.0
+opencv-python-headless==4.10.0.84
+Pillow==10.4.0
+numpy<2
 pycocotools
 OpenEXR
 Imath
+opencolorio==2.5.2
 imageio
 imageio-ffmpeg
 gradio==4.44.1
@@ -20,4 +21,5 @@ starlette==0.37.2
 uvicorn==0.30.6
 pydantic==2.10.6
 huggingface_hub<1.0
-git+https://github.com/facebookresearch/sam3.git
+# SAM 3 itself is installed by bootstrap_tmp_venv.sh. The first resolved Git
+# commit is recorded under tmp/runtime-locks and reused on later venv rebuilds.

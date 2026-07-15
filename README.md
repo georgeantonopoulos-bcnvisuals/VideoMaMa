@@ -39,15 +39,36 @@ VideoMaMa is an open-source project. If you find our work helpful, please consid
 - [ ] Evaluation Code.
 - [ ] Release MA-V dataset.
 
-# ⚙️ Setup
-Please run
+# 🎬 Studio Production Rotoscoping Harness
+
+This fork includes a production sequence UI that combines multi-keyframe SAM 3
+tracking with VideoMaMa matting. It supports image/EXR sequences, letterboxed
+prompting, resumable runs, selected frame ranges, overlap cross-fading, and
+16-bit PNG or half-float EXR alpha output.
+
+On the Rocky production servers, use the split runtime bootstrap:
+
+```bash
+bash scripts/bootstrap_tmp_venv.sh
+source .videomama-env
+bash scripts/run_production_frame_ui.sh
+```
+
+See `AGENTS.md` and `inference.md` for the production runtime layout and
+checkpoint environment variables.
+
+# ⚙️ Upstream Training Setup
+
+The original upstream SAM2/Conda setup remains available for training and the
+legacy uploaded-video demo. It is not the setup path for the production SAM 3
+sequence harness.
+
 ```bash
 bash scripts/setup.sh
 ```
-it will down load stable video diffusion weight, and setup virtual enviroment needed to run whole codes.  
-We use `conda activate videomama`.
 
-This will download sam2 which is needed for training sam2-matte.
+This downloads the upstream weights and creates the original training
+environments. We use `conda activate videomama` for that workflow.
 
 
 # 🎮 Demo

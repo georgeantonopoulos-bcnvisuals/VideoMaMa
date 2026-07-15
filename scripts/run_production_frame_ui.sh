@@ -19,7 +19,7 @@ fi
 
 UI_VENV="${VIDEOMAMA_UI_VENV:-/tmp/videomama-sam3-ui-venv}"
 
-if [[ ! -d "${UI_VENV}" ]]; then
+if [[ ! -x "${UI_VENV}/bin/python" ]]; then
   echo "Missing SAM 3 UI environment: ${UI_VENV}" >&2
   echo "Bootstrap it first:" >&2
   echo "  bash ${REPO_ROOT}/scripts/bootstrap_tmp_venv.sh sam3-ui" >&2

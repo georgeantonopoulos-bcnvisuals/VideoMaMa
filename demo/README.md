@@ -12,7 +12,14 @@ license: apache-2.0
 
 # 🎬 VideoMaMa: Video Matting with Mask Guidance
 
-An interactive demo for high-quality video matting using sparse mask guidance. This demo combines SAM2 for automatic object tracking with our VideoMaMa model for generating alpha mattes.
+The repository contains two interfaces:
+
+- `app.py` is the original uploaded-video SAM2 demo.
+- `production_frame_app.py` is the studio sequence harness. It combines SAM 3
+  point/text prompting and propagation with VideoMaMa over image or EXR shots.
+
+For production rotoscoping, use `production_frame_app.py` through
+`scripts/run_production_frame_ui.sh`.
 
 ## 🌟 Features
 
@@ -22,7 +29,24 @@ An interactive demo for high-quality video matting using sparse mask guidance. T
 - **Flexible Input**: Upload your own video or try our provided samples
 - **Customizable**: Adjust augmentation settings for different scenarios
 
-## 🚀 How to Use
+## 🚀 Production Sequence Workflow
+
+1. Bootstrap with `bash scripts/bootstrap_tmp_venv.sh` and authenticate the UI
+   venv for the gated `facebook/sam3` or `facebook/sam3.1` checkpoint.
+2. Launch `bash scripts/run_production_frame_ui.sh`.
+3. Load an image/EXR sequence directory and add point keyframes or a text concept.
+4. Generate SAM 3 masks for the full sequence.
+5. Run VideoMaMa over the full shot or an inclusive frame range.
+6. Review 8-bit previews under `videomama_frames` and use the production alpha
+   from `alpha_frames` (16-bit PNG, half EXR, or both).
+
+Runs are saved under `tmp/production_sequence_app`, with a manifest recording
+source fingerprints, prompts, model settings, generated frames, and completion
+status. Chunk overlaps are cross-faded to reduce visible range boundaries.
+EXR previews may use the simple exposure/gamma transform or the server's active
+`OCIO` configuration with an input colorspace, display, and view.
+
+## 🚀 Legacy Uploaded-Video Demo
 
 1. **Upload a video** or **select from samples**
 2. **Click on the object** you want to extract in the first frame (displayed in the interface)
@@ -63,10 +87,10 @@ python app.py
 - **UNet**: Fine-tuned with additional mask conditioning channels
 - **Processing**: Chunked inference (16 frames per chunk)
 
-### SAM2 Integration
-- Uses SAM2 video predictor for mask tracking
-- Propagates mask from single click point through entire video
-- Generates temporally consistent segmentation masks
+### SAM Integration
+- The production sequence harness uses SAM 3 with multi-keyframe point prompts
+  or text concepts.
+- The legacy uploaded-video demo continues to use SAM2.
 
 ## 🤝 Contributing
 

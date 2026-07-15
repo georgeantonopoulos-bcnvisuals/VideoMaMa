@@ -8,8 +8,10 @@ sequence directory.
 
 import shutil
 import tempfile
+import time
+import uuid
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional
 
 import numpy as np
 from PIL import Image
@@ -70,6 +72,7 @@ class SAM3VideoTracker:
             ) from exc
 
         self.device = device
+        self.model_version = str(model_version)
         try:
             import torch
         except ImportError as exc:
@@ -85,8 +88,14 @@ class SAM3VideoTracker:
         _assert_hf_sam3_access(repo_id)
 
         kwargs = {}
-        if gpus_to_use is not None:
+        # The legacy SAM 3 video predictor supports explicit multi-GPU IDs.
+        # SAM 3.1's multiplex predictor is single-device and rejects this kwarg.
+        if model_version == "sam3" and gpus_to_use is not None:
             kwargs["gpus_to_use"] = gpus_to_use
+        if model_version == "sam3.1":
+            # FA3 is an optional Hopper-only extension and is not installed in
+            # the production venv. PyTorch attention is slower but equivalent.
+            kwargs["use_fa3"] = False
         kwargs["version"] = model_version
         self.predictor = build_sam3_predictor(**kwargs)
         self.last_text_prompt_stats = {}
@@ -186,6 +195,29 @@ class SAM3VideoTracker:
         }
 
     def _start_session(self, frames_dir: str):
+        if self.model_version == "sam3.1":
+            # The upstream base predictor currently forwards
+            # ``offload_state_to_cpu`` to the multiplex model, whose init_state
+            # signature does not accept it. Initialize and register the session
+            # directly until the upstream predictor signatures converge.
+            init_kwargs = {
+                "resource_path": str(frames_dir),
+                "offload_video_to_cpu": False,
+            }
+            if hasattr(self.predictor, "async_loading_frames"):
+                init_kwargs["async_loading_frames"] = self.predictor.async_loading_frames
+            if hasattr(self.predictor, "video_loader_type"):
+                init_kwargs["video_loader_type"] = self.predictor.video_loader_type
+            inference_state = self.predictor.model.init_state(**init_kwargs)
+            session_id = str(uuid.uuid4())
+            now = time.time()
+            self.predictor._all_inference_states[session_id] = {
+                "state": inference_state,
+                "session_id": session_id,
+                "start_time": now,
+                "last_use_time": now,
+            }
+            return session_id
         response = self.predictor.handle_request(
             request={
                 "type": "start_session",
@@ -264,6 +296,8 @@ class SAM3VideoTracker:
         prompts_by_frame,
         obj_id: int = 1,
         output_prob_thresh: float = 0.5,
+        mask_callback: Optional[Callable[[int, np.ndarray], None]] = None,
+        collect_masks: bool = True,
     ) -> List[np.ndarray]:
         prompts_by_frame = self._normalize_prompts_by_frame(prompts_by_frame)
         height, width, num_frames = self._frame_shape_from_dir(frames_dir)
@@ -286,9 +320,21 @@ class SAM3VideoTracker:
                 )
                 latest_outputs[frame_idx] = response.get("outputs", {})
 
-            final_masks = [np.zeros((height, width), dtype=np.uint8) for _ in range(num_frames)]
+            final_masks = [
+                np.zeros((height, width), dtype=np.uint8) if collect_masks else None
+                for _ in range(num_frames)
+            ]
+            mask_areas = {}
+
+            def record_mask(frame_idx, mask):
+                mask_areas[int(frame_idx)] = int((mask > 0).sum())
+                if collect_masks:
+                    final_masks[int(frame_idx)] = mask
+                if mask_callback is not None:
+                    mask_callback(int(frame_idx), mask)
+
             for frame_idx, outputs in latest_outputs.items():
-                final_masks[frame_idx] = self._extract_mask(outputs, (height, width), obj_id=obj_id)
+                record_mask(frame_idx, self._extract_mask(outputs, (height, width), obj_id=obj_id))
 
             # SAM 3's add_prompt path runs the model under a bf16 autocast context,
             # but the library's propagate_in_video (sam3_base_predictor) does not wrap
@@ -318,12 +364,15 @@ class SAM3VideoTracker:
                     }
                 ):
                     frame_idx = int(response["frame_index"])
-                    final_masks[frame_idx] = self._extract_mask(response.get("outputs", {}), (height, width), obj_id=obj_id)
+                    record_mask(
+                        frame_idx,
+                        self._extract_mask(response.get("outputs", {}), (height, width), obj_id=obj_id),
+                    )
         finally:
             self._close_session(session_id)
 
-        frames_with_pixels = sum(1 for mask in final_masks if np.any(mask))
-        total_pixels = int(sum((mask > 0).sum() for mask in final_masks))
+        frames_with_pixels = sum(1 for area in mask_areas.values() if area > 0)
+        total_pixels = int(sum(mask_areas.values()))
         print(
             f"Generated {len(final_masks)} SAM 3 masks from {len(keyframes)} keyframes; "
             f"frames_with_pixels={frames_with_pixels}/{num_frames}, total_pixels={total_pixels}, "
@@ -337,6 +386,8 @@ class SAM3VideoTracker:
         text: str,
         frame_idx: int = 0,
         output_prob_thresh: float = 0.5,
+        mask_callback: Optional[Callable[[int, np.ndarray], None]] = None,
+        collect_masks: bool = True,
     ) -> List[np.ndarray]:
         height, width, num_frames = self._frame_shape_from_dir(frames_dir)
         frame_idx = max(0, min(int(frame_idx), num_frames - 1))
@@ -344,8 +395,20 @@ class SAM3VideoTracker:
         session_id = self._start_session(frames_dir)
         try:
             response = self._add_text_prompt(session_id, frame_idx, text, output_prob_thresh=output_prob_thresh)
-            final_masks = [np.zeros((height, width), dtype=np.uint8) for _ in range(num_frames)]
-            final_masks[frame_idx] = self._extract_combined_mask(response.get("outputs", {}), (height, width))
+            final_masks = [
+                np.zeros((height, width), dtype=np.uint8) if collect_masks else None
+                for _ in range(num_frames)
+            ]
+            mask_areas = {}
+
+            def record_mask(out_frame_idx, mask):
+                mask_areas[int(out_frame_idx)] = int((mask > 0).sum())
+                if collect_masks:
+                    final_masks[int(out_frame_idx)] = mask
+                if mask_callback is not None:
+                    mask_callback(int(out_frame_idx), mask)
+
+            record_mask(frame_idx, self._extract_combined_mask(response.get("outputs", {}), (height, width)))
 
             import torch
 
@@ -360,14 +423,15 @@ class SAM3VideoTracker:
                     }
                 ):
                     out_frame_idx = int(response["frame_index"])
-                    final_masks[out_frame_idx] = self._extract_combined_mask(
-                        response.get("outputs", {}), (height, width)
+                    record_mask(
+                        out_frame_idx,
+                        self._extract_combined_mask(response.get("outputs", {}), (height, width)),
                     )
         finally:
             self._close_session(session_id)
 
-        frames_with_pixels = sum(1 for mask in final_masks if np.any(mask))
-        total_pixels = int(sum((mask > 0).sum() for mask in final_masks))
+        frames_with_pixels = sum(1 for area in mask_areas.values() if area > 0)
+        total_pixels = int(sum(mask_areas.values()))
         self.last_text_prompt_stats.update(
             {
                 "frames_with_pixels": int(frames_with_pixels),

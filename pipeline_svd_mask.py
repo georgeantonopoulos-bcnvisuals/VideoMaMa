@@ -879,7 +879,7 @@ class VideoInferencePipeline:
         print(f"--- Models Loaded Successfully on {self.device} ---")
 
     def run(self, cond_frames, mask_frames, seed=42, mask_cond_mode="vae", fps=7, motion_bucket_id=127,
-            noise_aug_strength=0.0):
+            noise_aug_strength=0.0, frame_indices=None, output_type="pil"):
         """
         Runs the core inference process on a sequence of conditioning and mask frames.
 
@@ -891,6 +891,11 @@ class VideoInferencePipeline:
             fps (int): Frames per second to condition the model with.
             motion_bucket_id (int): Motion bucket ID for conditioning.
             noise_aug_strength (float): Noise augmentation strength.
+            frame_indices (list[int] | None): Stable source-frame indices used to
+                derive per-frame noise. Supplying these makes overlapping chunks
+                use identical noise for the same source frames.
+            output_type (str): ``"pil"`` for the legacy 8-bit PIL result or
+                ``"numpy"`` for float32 HWC arrays in the [0, 1] range.
 
         Returns:
             list[Image.Image]: A list of the generated video frames as PIL Images.
@@ -933,9 +938,23 @@ class VideoInferencePipeline:
                 raise ValueError(f"Unknown mask_cond_mode: {mask_cond_mode}")
 
             # --- 4. Run UNet Single-Step Inference ---
-            generator = torch.Generator(device=self.device).manual_seed(seed)
-            noisy_latents = torch.randn(cond_latents.shape, generator=generator, device=self.device,
-                                        dtype=self.weight_dtype)
+            if frame_indices is None:
+                frame_indices = list(range(cond_latents.shape[1]))
+            if len(frame_indices) != cond_latents.shape[1]:
+                raise ValueError(
+                    f"Expected {cond_latents.shape[1]} frame indices, got {len(frame_indices)}."
+                )
+            noise_frames = []
+            for frame_index in frame_indices:
+                generator = torch.Generator(device=self.device).manual_seed(int(seed) + int(frame_index))
+                frame_shape = (
+                    cond_latents.shape[0], 1, cond_latents.shape[2],
+                    cond_latents.shape[3], cond_latents.shape[4],
+                )
+                noise_frames.append(
+                    torch.randn(frame_shape, generator=generator, device=self.device, dtype=self.weight_dtype)
+                )
+            noisy_latents = torch.cat(noise_frames, dim=1)
             timesteps = torch.full((1,), 1.0, device=self.device, dtype=torch.long)
             added_time_ids = self._get_add_time_ids(fps, motion_bucket_id, noise_aug_strength, batch_size=1)
 
@@ -955,7 +974,10 @@ class VideoInferencePipeline:
             video_tensor = torch.cat(frames, dim=0)
             video_tensor = (video_tensor / 2.0 + 0.5).clamp(0, 1).mean(dim=1, keepdim=True).repeat(1, 3, 1, 1).float()
 
-            # Return a list of PIL images
+            if output_type == "numpy":
+                return [frame.permute(1, 2, 0).cpu().numpy() for frame in video_tensor]
+            if output_type != "pil":
+                raise ValueError(f"Unsupported output_type: {output_type}")
             return [transforms.ToPILImage()(frame) for frame in video_tensor]
 
     def _pil_to_tensor(self, frames: list[Image.Image]):
@@ -977,7 +999,10 @@ class VideoInferencePipeline:
         encode_chunk = max(1, int(os.environ.get("VIDEOMAMA_VAE_ENCODE_CHUNK", "4")))
         latent_chunks = []
         for i in range(0, t.shape[0], encode_chunk):
-            latent_chunks.append(self.vae.encode(t[i: i + encode_chunk]).latent_dist.sample())
+            # Conditioning must be deterministic across overlapping chunks. The
+            # posterior mode avoids unseeded VAE sampling changing the same frame
+            # when it appears at a different chunk boundary.
+            latent_chunks.append(self.vae.encode(t[i: i + encode_chunk]).latent_dist.mode())
         latents = torch.cat(latent_chunks, dim=0)
         latents = rearrange(latents, "(b f) c h w -> b f c h w", f=video_length)
         return latents * self.vae.config.scaling_factor
