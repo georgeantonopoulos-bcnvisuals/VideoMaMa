@@ -17,7 +17,8 @@ if [[ -f "${ENV_FILE}" ]]; then
   source "${ENV_FILE}"
 fi
 
-UI_VENV="${VIDEOMAMA_UI_VENV:-/tmp/videomama-sam3-ui-venv}"
+VENV_ROOT="${VIDEOMAMA_VENV_ROOT:-/mnt/temporal/VideoMama}"
+UI_VENV="${VIDEOMAMA_UI_VENV:-${VENV_ROOT}/videomama-sam3-ui-venv}"
 
 if [[ ! -x "${UI_VENV}/bin/python" ]]; then
   echo "Missing SAM 3 UI environment: ${UI_VENV}" >&2
@@ -36,6 +37,19 @@ export VIDEOMAMA_UI_HOST="${VIDEOMAMA_UI_HOST:-127.0.0.1}"
 export VIDEOMAMA_UI_PORT="${VIDEOMAMA_UI_PORT:-7861}"
 export VIDEOMAMA_UI_SHARE="${VIDEOMAMA_UI_SHARE:-1}"
 export SAM3_MODEL_VERSION="${SAM3_MODEL_VERSION:-sam3}"
+
+# The SAM2Matting backend runs in its own venv and its own process; the UI only
+# needs to know where to find it. Both are also recorded in
+# tmp/runtime-locks/sam2matting-runtime.json, which the app reads as a fallback,
+# so the UI still starts (with SAM2Matting unavailable) when this is unset.
+export VIDEOMAMA_VENV_ROOT="${VENV_ROOT}"
+export VIDEOMAMA_SAM2MATTING_VENV="${VIDEOMAMA_SAM2MATTING_VENV:-${VENV_ROOT}/videomama-sam2matting-venv}"
+export VIDEOMAMA_SAM2MATTING_HOME="${VIDEOMAMA_SAM2MATTING_HOME:-${VENV_ROOT}/videomama-sam2matting-src}"
+if [[ ! -x "${VIDEOMAMA_SAM2MATTING_VENV}/bin/python" ]]; then
+  echo "Note: SAM2Matting runtime not found at ${VIDEOMAMA_SAM2MATTING_VENV}." >&2
+  echo "      The UI will start, but the SAM2Matting backends will refuse to run." >&2
+  echo "      Build it with: bash ${REPO_ROOT}/scripts/bootstrap_sam2matting.sh" >&2
+fi
 
 # SAM 3 and VideoMaMa share one GPU, so the allocator churns between two large
 # models across many chunks. expandable_segments lets PyTorch grow allocations in

@@ -15,8 +15,10 @@ license: apache-2.0
 The repository contains two interfaces:
 
 - `app.py` is the original uploaded-video SAM2 demo.
-- `production_frame_app.py` is the studio sequence harness. It combines SAM 3
-  point/text prompting and propagation with VideoMaMa over image or EXR shots.
+- `production_frame_app.py` is the studio sequence harness. It combines SAM 3 / 3.1
+  point/text prompting and propagation with a selectable matting backend over image
+  or EXR shots: SAM2Matting SAM2.1 Base+ by default, VideoMaMa as an alternative
+  and rescue path. See `../docs/sam2matting.md`.
 
 For production rotoscoping, use `production_frame_app.py` through
 `scripts/run_production_frame_ui.sh`.
@@ -31,8 +33,16 @@ For production rotoscoping, use `production_frame_app.py` through
 
 ## 🚀 Production Sequence Workflow
 
-1. Bootstrap with `bash scripts/bootstrap_tmp_venv.sh` and authenticate the UI
-   venv for the gated `facebook/sam3` or `facebook/sam3.1` checkpoint.
+0. Runtimes live under `$VIDEOMAMA_VENV_ROOT` (default `/mnt/temporal/VideoMama`),
+   not `/tmp` — `/tmp` is the root filesystem on these hosts and too small.
+1. Bootstrap with `bash scripts/bootstrap_tmp_venv.sh everything` and authenticate
+   the UI venv for the gated `facebook/sam3` or `facebook/sam3.1` checkpoint. The
+   `everything` target also builds the isolated SAM2Matting runtime; run
+   `bash scripts/bootstrap_sam2matting.sh` on its own to (re)build just that.
+1b. Pick the **Tracking Model** (`sam3` / `sam3.1`) and the **Matting Backend**.
+   Leave **Matte ROI** on `Auto (from SAM 3 masks)` unless you want to frame the
+   subject yourself. Note that SAM2Matting always runs its network at 1024px
+   square — the ROI, not the source resolution, is what buys edge detail.
 2. Launch `bash scripts/run_production_frame_ui.sh`.
 3. Optionally open **SAM Source ROI Crop**, load a full-resolution selector frame,
    and click two opposite corners. The fixed source ROI is cropped before it is

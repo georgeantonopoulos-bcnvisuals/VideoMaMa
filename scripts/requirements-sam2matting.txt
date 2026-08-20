@@ -1,0 +1,36 @@
+# Isolated SAM2Matting runtime (Python 3.10-3.12).
+#
+# This set is installed into $VIDEOMAMA_VENV_ROOT/videomama-sam2matting-venv ONLY.
+# It must never
+# be installed into the SAM 3 UI venv: SAM2Matting vendors modified top-level
+# `sam2` and `sam3` packages that would shadow our official SAM 3 install.
+#
+# Torch is installed separately from the CUDA index by
+# scripts/bootstrap_sam2matting.sh (upstream pins torch 2.8.0 / torchvision 0.23.0).
+#
+# Upstream's requirements.txt also lists training/eval dependencies (detectron2,
+# submitit, tensorboard, pandas, matplotlib, fvcore, scikit-image). None are
+# reachable from the video-matting inference path, so they are omitted to keep
+# this environment small and fast to rebuild.
+numpy<2
+Pillow
+tqdm
+hydra-core
+omegaconf
+iopath
+opencv-python-headless
+huggingface_hub<1.0
+pycocotools
+einops
+timm
+loguru
+ftfy
+regex
+psutil
+scipy
+tensordict
+# Needed only by the experimental vendored-SAM3 variant's builder imports.
+open-clip-torch
+# torch-tensorrt is upstream's optional compile/TRT path. Left out on purpose:
+# eager BF16 inference must be correct first, and the TRT wheel is large and
+# brittle. Install it manually if you want to evaluate --compiled.

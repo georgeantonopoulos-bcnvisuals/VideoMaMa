@@ -6,6 +6,7 @@ preview a prompted frame, and propagate prompted keyframes through a JPEG
 sequence directory.
 """
 
+import os
 import shutil
 import tempfile
 import time
@@ -15,6 +16,15 @@ from typing import Callable, Dict, List, Optional
 
 import numpy as np
 from PIL import Image
+
+
+def _ui_venv_path() -> str:
+    """Where this UI environment lives, for actionable error messages."""
+    venv = os.environ.get("VIDEOMAMA_UI_VENV")
+    if venv:
+        return venv
+    root = os.environ.get("VIDEOMAMA_VENV_ROOT", "/mnt/temporal/VideoMama")
+    return f"{root}/videomama-sam3-ui-venv"
 
 
 def _assert_hf_sam3_access(repo_id: str):
@@ -32,20 +42,20 @@ def _assert_hf_sam3_access(repo_id: str):
         raise RuntimeError(
             f"SAM 3 checkpoint repo `{repo_id}` is gated. Request access at "
             f"https://huggingface.co/{repo_id}, then authenticate this machine with "
-            "`/tmp/videomama-sam3-ui-venv/bin/hf auth login`."
+            f"`{_ui_venv_path()}/bin/hf auth login`."
         ) from exc
     except HfHubHTTPError as exc:
         status_code = getattr(getattr(exc, "response", None), "status_code", None)
         if status_code in {401, 403}:
             raise RuntimeError(
                 f"SAM 3 checkpoint repo `{repo_id}` requires Hugging Face authentication. "
-                "Run `/tmp/videomama-sam3-ui-venv/bin/hf auth login` with a token that has access."
+                f"Run `{_ui_venv_path()}/bin/hf auth login` with a token that has access."
             ) from exc
         raise
     except LocalEntryNotFoundError as exc:
         raise RuntimeError(
             f"Could not reach or cache SAM 3 checkpoint repo `{repo_id}`. Check network access to "
-            "huggingface.co and authenticate with `/tmp/videomama-sam3-ui-venv/bin/hf auth login`."
+            f"huggingface.co and authenticate with `{_ui_venv_path()}/bin/hf auth login`."
         ) from exc
 
 
@@ -63,12 +73,12 @@ class SAM3VideoTracker:
             raise RuntimeError(
                 f"SAM 3 dependency import failed because `{missing_module}` is missing. "
                 "Refresh the SAM 3 UI environment with "
-                "`/tmp/videomama-sam3-ui-venv/bin/python -m pip install -r scripts/requirements-sam3-ui.txt`."
+                f"`{_ui_venv_path()}/bin/python -m pip install -r scripts/requirements-sam3-ui.txt`."
             ) from exc
         except ImportError as exc:
             raise RuntimeError(
                 "SAM 3 failed to import. Refresh the production UI environment with "
-                "`/tmp/videomama-sam3-ui-venv/bin/python -m pip install -r scripts/requirements-sam3-ui.txt`."
+                f"`{_ui_venv_path()}/bin/python -m pip install -r scripts/requirements-sam3-ui.txt`."
             ) from exc
 
         self.device = device

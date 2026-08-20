@@ -75,6 +75,20 @@ except ImportError as exc:
 
 from tools.painter import mask_painter, point_painter
 
+# Matting-backend layer. These modules are intentionally torch-free so the UI,
+# the isolated SAM2Matting worker, and the tests can all import them.
+import matting_backends as mb
+import matte_qc
+import sam2matting_client
+import subject_roi
+from alpha_transforms import (
+    blend_overlap_alpha as _blend_overlap_alpha,
+    crop_to_roi as _crop_to_roi,
+    downsample_for_metrics as _qc_downsample,
+    place_alpha_from_roi as _place_alpha_from_roi,
+    resize_alpha as _resize_alpha,
+)
+
 
 def load_sam3_tracker(*args, **kwargs):
     from sam3_wrapper_hf import load_sam3_tracker as loader
@@ -116,6 +130,16 @@ POINT_RADIUS = 15
 SUPPORTED_IMAGE_EXTS = {".exr", ".png", ".jpg", ".jpeg", ".tif", ".tiff"}
 ALPHA_OUTPUT_FORMATS = ('16-bit PNG', 'Half EXR', 'Both')
 
+# The matte ROI is resolved at matting time, unlike the load-time SAM ROI crop:
+# it can be derived from masks that do not exist until SAM 3 has run.
+MATTE_ROI_MODES = ('Auto (from SAM 3 masks)', 'Manual SAM ROI crop', 'Full frame')
+# SAM 3 stays the tracker for both matting backends; this only picks which
+# released weights it uses. Both are gated on Hugging Face and need separate
+# access grants, so the selection is a session setting rather than a hard pin.
+TRACKING_MODELS = ('sam3', 'sam3.1')
+DEFAULT_MATTE_ROI_PADDING = 0.12
+DEFAULT_MATTE_ROI_MIN_GAIN = 1.35
+
 # Anchor the app's working area to the repo (not the launch CWD) so settings and
 # prior runs are found reliably and outputs land where AGENTS.md documents them.
 APP_TMP_ROOT = REPO_ROOT / 'tmp' / 'production_sequence_app'
@@ -150,6 +174,19 @@ DEFAULT_SETTINGS = {
     'sam_crop_width': 0,
     'sam_crop_height': 0,
     'refine_edges_against_plate': False,
+    'tracking_model': os.environ.get('SAM3_MODEL_VERSION', 'sam3'),
+    'matting_backend': mb.SAM2MATTING_BASE_PLUS.label,
+    'matte_roi_mode': MATTE_ROI_MODES[0],
+    'matte_roi_padding': DEFAULT_MATTE_ROI_PADDING,
+    'matte_roi_min_gain': DEFAULT_MATTE_ROI_MIN_GAIN,
+    's2m_conditioning': mb.DEFAULT_CONDITIONING_LABEL,
+    's2m_guidance_interval': mb.DEFAULT_GUIDANCE_INTERVAL,
+    's2m_frame_cap': 2048,
+    's2m_window_size': 300,
+    's2m_window_overlap': 8,
+    's2m_offload': True,
+    's2m_bf16': True,
+    'matte_qc_enabled': True,
     'free_gpu_after_run': True,
     'alpha_output_format': '16-bit PNG',
     'chunk_size': 16,
@@ -516,7 +553,7 @@ UI_OUTPUT_DEBUG_INDEX = 12
 UI_OUTPUT_COUNT = 13
 CLEARED_RUN_PREFIX = "cleared"
 RUN_MANIFEST_NAME = 'run_manifest.json'
-RUN_MANIFEST_SCHEMA = 2
+RUN_MANIFEST_SCHEMA = 3
 
 
 def _append_debug_line(line):
@@ -650,7 +687,11 @@ def _save_ui_settings(sequence_dir, exr_gamma, exr_exposure, exr_color_mode,
                       videomama_seed, videomama_fps, videomama_motion_bucket_id,
                       videomama_noise_aug_strength, videomama_guide_expand_px, processing_resolution,
                       sam_crop_enabled, sam_crop_x, sam_crop_y, sam_crop_width, sam_crop_height,
-                      refine_edges_against_plate, free_gpu_after_run, alpha_output_format, chunk_size, overlap,
+                      refine_edges_against_plate,
+                      tracking_model, matting_backend, matte_roi_mode, matte_roi_padding, matte_roi_min_gain,
+                      s2m_conditioning, s2m_guidance_interval, s2m_frame_cap,
+                      s2m_window_size, s2m_window_overlap, s2m_offload, s2m_bf16, matte_qc_enabled,
+                      free_gpu_after_run, alpha_output_format, chunk_size, overlap,
                       custom_output_dir, resume_from_tmp, range_start, range_end):
     """Persist the current input panel so the next launch restores it."""
     APP_TMP_ROOT.mkdir(parents=True, exist_ok=True)
@@ -683,6 +724,19 @@ def _save_ui_settings(sequence_dir, exr_gamma, exr_exposure, exr_color_mode,
         'sam_crop_width': int(sam_crop_width or 0),
         'sam_crop_height': int(sam_crop_height or 0),
         'refine_edges_against_plate': bool(refine_edges_against_plate),
+        'tracking_model': str(tracking_model or 'sam3'),
+        'matting_backend': mb.resolve_backend(matting_backend).label,
+        'matte_roi_mode': str(matte_roi_mode or MATTE_ROI_MODES[0]),
+        'matte_roi_padding': float(matte_roi_padding),
+        'matte_roi_min_gain': float(matte_roi_min_gain),
+        's2m_conditioning': str(s2m_conditioning or mb.DEFAULT_CONDITIONING_LABEL),
+        's2m_guidance_interval': int(s2m_guidance_interval),
+        's2m_frame_cap': int(s2m_frame_cap),
+        's2m_window_size': int(s2m_window_size),
+        's2m_window_overlap': int(s2m_window_overlap),
+        's2m_offload': bool(s2m_offload),
+        's2m_bf16': bool(s2m_bf16),
+        'matte_qc_enabled': bool(matte_qc_enabled),
         'free_gpu_after_run': bool(free_gpu_after_run),
         'alpha_output_format': str(alpha_output_format or '16-bit PNG'),
         'chunk_size': int(chunk_size),
@@ -780,6 +834,58 @@ def _sam_crop_status_suffix(transform):
     )
 
 
+@_serialized_gpu_job
+def set_tracking_model(tracking_model):
+    """Switch the SAM 3 weights used for tracking, dropping any loaded tracker.
+
+    The version is read from the environment wherever SAM 3 is built, and it is
+    already part of the SAM manifest, so switching it invalidates cached masks
+    and every matte derived from them without any extra bookkeeping here.
+    """
+    version = str(tracking_model or 'sam3')
+    if version not in TRACKING_MODELS:
+        raise gr.Error(f"Unsupported tracking model: {tracking_model}")
+    previous = os.environ.get('SAM3_MODEL_VERSION', 'sam3')
+    os.environ['SAM3_MODEL_VERSION'] = version
+    if previous != version:
+        _unload_sam3_tracker()
+    message = (
+        f"Tracking model set to {version}."
+        + ("" if previous == version else " Existing SAM 3 masks will be regenerated on the next run.")
+    )
+    _append_debug_line(message)
+    return message, _debug_console_text()
+
+
+def _backend_info_markdown(matting_backend):
+    """One-paragraph description of the selected backend, shown under the picker."""
+    try:
+        spec = mb.resolve_backend(matting_backend)
+    except ValueError:
+        return ''
+    lines = [f"**{spec.label}** — {spec.notes}"]
+    if spec.family == 'sam2matting':
+        lines.append(
+            f"Runs at {spec.model_resolution}px square internally with a "
+            f"{spec.alpha_head_resolution}px alpha head, in an isolated venv/process. "
+            f"Feeding it a 4K plate does **not** make inference 4K — use the matte ROI."
+        )
+        runtime = mb.read_runtime_lock(REPO_ROOT)
+        if runtime.get('commit'):
+            lines.append(
+                f"Runtime: upstream `{str(runtime['commit'])[:12]}`, torch "
+                f"{runtime.get('torch_version', '?')}, checkpoints revision "
+                f"`{str(runtime.get('checkpoint_revision', ''))[:12]}`."
+            )
+        else:
+            lines.append(
+                "_Not bootstrapped yet._ Run `bash scripts/bootstrap_sam2matting.sh`."
+            )
+    if spec.experimental:
+        lines.append("_Experimental: not validated for production delivery._")
+    return '\n\n'.join(lines)
+
+
 def apply_quality_preset(quality_preset):
     preset = QUALITY_PRESETS.get(str(quality_preset or 'Balanced'), QUALITY_PRESETS['Balanced'])
     if not preset:
@@ -820,6 +926,46 @@ def _free_cuda_cache():
                 pass
     except Exception:
         pass
+
+
+def _cuda_available():
+    try:
+        import torch
+
+        return bool(torch.cuda.is_available())
+    except Exception:
+        return False
+
+
+def _checkpoints_root():
+    return os.environ.get(
+        'VIDEOMAMA_CHECKPOINTS',
+        '/mnt/production/project/bcn_lib/work/AI/VideoMaMa/checkpoints',
+    )
+
+
+def _load_state_rgb_frame(state, frame_idx):
+    """Decode one source frame with this session's EXR/OCIO settings."""
+    color = state.get('exr_color_settings') or {}
+    return _load_rgb_frame(
+        state['frame_paths'][int(frame_idx)],
+        exr_gamma=state['exr_gamma'],
+        exr_exposure=state.get('exr_exposure', 0.0),
+        exr_color_mode=color.get('mode', 'Gamma / Exposure'),
+        ocio_input_colorspace=color.get('input_colorspace', 'scene_linear'),
+        ocio_display=color.get('display', ''),
+        ocio_view=color.get('view', ''),
+    )
+
+
+def _load_state_sam_mask(state, frame_idx):
+    """Load the source-resolution SAM 3 mask generated for one frame."""
+    frame_name = state['frame_names'][int(frame_idx)]
+    mask_path = Path(state['generated_masks_dir']) / f"{Path(frame_name).stem}.png"
+    if not mask_path.exists():
+        raise gr.Error(f"Missing SAM 3 mask for {frame_name}: {mask_path}")
+    with Image.open(mask_path) as image:
+        return np.array(image.convert('L'))
 
 
 def _unload_videomama_pipeline():
@@ -1678,9 +1824,16 @@ def _frame_info(state):
         return "No sequence loaded."
     frame_idx = state['current_frame_idx']
     transform = (state.get('frame_transforms') or [{}])[frame_idx]
+    backend_id = state.get('matte_backend_id')
+    backend_note = ''
+    if backend_id and (state.get('matte_output_dir') or state.get('videomama_output_dir')):
+        try:
+            backend_note = f" | matte: {mb.resolve_backend(backend_id).label}"
+        except ValueError:
+            backend_note = f" | matte: {backend_id}"
     return (
         f"Frame {frame_idx + 1} / {len(state['frame_paths'])}: {state['frame_names'][frame_idx]}"
-        f"{_sam_crop_status_suffix(transform)}"
+        f"{_sam_crop_status_suffix(transform)}{backend_note}"
     )
 
 
@@ -1739,11 +1892,33 @@ def _clear_preview_masks(state, frame_indices=None):
                 pass
 
 
-def _videomama_output_path(state, frame_idx):
-    if not state.get('videomama_output_dir'):
+def _matte_output_path(state, frame_idx):
+    """Preview PNG for the currently displayed matte, whichever backend made it."""
+    output_dir = state.get('matte_output_dir') or state.get('videomama_output_dir')
+    if not output_dir:
         return None
     frame_stem = Path(state['frame_names'][frame_idx]).stem
-    return Path(state['videomama_output_dir']) / f"{frame_stem}.png"
+    return Path(output_dir) / f"{frame_stem}.png"
+
+
+
+def _matte_viewer_label(state):
+    """Name the backend whose matte is on screen.
+
+    The viewer used to be hard-labelled "VideoMaMa", which made a SAM2Matting
+    result look like it had not been produced at all. What is on screen is
+    whatever backend last wrote to this run, so say which one.
+    """
+    if not state or not (state.get('matte_output_dir') or state.get('videomama_output_dir')):
+        return 'Current Matte (none generated yet)'
+    backend_id = state.get('matte_backend_id')
+    if not backend_id:
+        return 'Current Matte'
+    try:
+        label = mb.resolve_backend(backend_id).label
+    except ValueError:
+        label = str(backend_id)
+    return f'Current Matte - {label}'
 
 
 def _resolve_videomama_output_dirs(run_root: Path, custom_output_dir: str):
@@ -1823,13 +1998,6 @@ def _save_matte_outputs(output_dir: Path, alpha_dir: Path, frame_name: str,
         (alpha_dir / f"{stem}.exr").unlink(missing_ok=True)
     elif alpha_output_format == 'Half EXR':
         (alpha_dir / f"{stem}.png").unlink(missing_ok=True)
-
-
-def _blend_overlap_alpha(previous: np.ndarray, current: np.ndarray, position: int, count: int):
-    if previous.shape != current.shape:
-        raise ValueError(f"Cannot blend overlap mattes with shapes {previous.shape} and {current.shape}.")
-    weight = float(position + 1) / float(count + 1)
-    return np.clip(previous * (1.0 - weight) + current * weight, 0.0, 1.0).astype(np.float32)
 
 
 def _matte_output_record_exists(output_dir: Path, alpha_dir: Path, frame_name: str, record):
@@ -1929,7 +2097,7 @@ def _compute_preview_mask(state, frame_idx, sam_output_prob_thresh=None):
 
 
 def _load_current_output(state, frame_idx):
-    output_path = _videomama_output_path(state, frame_idx)
+    output_path = _matte_output_path(state, frame_idx)
     if output_path is not None and output_path.exists():
         return np.array(Image.open(output_path).convert('RGB'))
     return None
@@ -1970,7 +2138,7 @@ def _ui_state_payload(state, status_message):
         preview,
         preview,
         mask,
-        output_preview,
+        gr.update(value=output_preview, label=_matte_viewer_label(state)),
         state,
         gr.update(value=state['current_frame_idx']),
         gr.update(value=state['current_frame_idx']),
@@ -2171,29 +2339,42 @@ def load_sequence(sequence_dir: str, exr_gamma: float, exr_exposure: float = DEF
         elif masks_dir.exists():
             print(f"Ignoring incomplete, unverified, or stale SAM 3 mask set in {masks_dir}")
 
-        videomama_manifest = manifest.get('videomama') or {}
-        outputs_dir = Path(videomama_manifest.get('output_dir') or (run_root / 'videomama_frames'))
-        videomama_sam_matches = (
+        # Restore whichever backend produced the run's most recent mattes. The
+        # matte section records its backend, so a Base+ result is never shown as
+        # if VideoMaMa had made it (and vice versa).
+        matte_manifest = _read_matte_manifest(run_root)
+        matte_backend_id = str(matte_manifest.get('backend_id') or 'videomama')
+        try:
+            matte_spec = mb.resolve_backend(matte_backend_id)
+        except ValueError:
+            matte_spec = mb.VIDEOMAMA_BACKEND
+        default_preview, default_alpha = matte_spec.output_dirnames()
+        outputs_dir = Path(matte_manifest.get('output_dir') or (run_root / default_preview))
+        matte_sam_matches = (
             sam_metadata_matches
-            and videomama_manifest.get('sam_prompt_hash') == sam_manifest.get('prompt_hash')
-            and int(videomama_manifest.get('sam_keyframe_policy_version', 0))
+            and matte_manifest.get('sam_prompt_hash') == sam_manifest.get('prompt_hash')
+            and int(matte_manifest.get('sam_keyframe_policy_version', 0))
                 == SAM_KEYFRAME_POLICY_VERSION
         )
-        if videomama_sam_matches and _sequence_outputs_complete(outputs_dir, frame_names, frame_sizes):
+        state['matte_backend_id'] = matte_spec.backend_id
+        if matte_sam_matches and _sequence_outputs_complete(outputs_dir, frame_names, frame_sizes):
             state['videomama_output_dir'] = str(outputs_dir)
-            restored.append('VideoMaMa outputs')
-        elif videomama_sam_matches and outputs_dir.exists():
-            print(f"Found a partial VideoMaMa output set in {outputs_dir}; keeping it for range resume.")
+            state['matte_output_dir'] = str(outputs_dir)
+            restored.append(f'{matte_spec.label} mattes')
+        elif matte_sam_matches and outputs_dir.exists():
+            print(f"Found a partial {matte_spec.label} output set in {outputs_dir}; keeping it for range resume.")
             state['videomama_output_dir'] = str(outputs_dir)
+            state['matte_output_dir'] = str(outputs_dir)
         elif outputs_dir.exists():
-            print(f"Ignoring stale VideoMaMa outputs created from an older SAM 3 mask set in {outputs_dir}")
-        alpha_dir = Path(videomama_manifest.get('alpha_dir') or (run_root / 'alpha_frames'))
+            print(f"Ignoring stale mattes created from an older SAM 3 mask set in {outputs_dir}")
+        alpha_dir = Path(matte_manifest.get('alpha_dir') or (run_root / default_alpha))
         if (
-            videomama_sam_matches
+            matte_sam_matches
             and alpha_dir.is_dir()
             and (any(alpha_dir.glob('*.png')) or any(alpha_dir.glob('*.exr')))
         ):
             state['alpha_output_dir'] = str(alpha_dir)
+            state['matte_alpha_dir'] = str(alpha_dir)
 
     if restored:
         status_message = (
@@ -2214,7 +2395,7 @@ def load_sequence(sequence_dir: str, exr_gamma: float, exr_exposure: float = DEF
         preview,
         preview,
         mask,
-        output_preview,
+        gr.update(value=output_preview, label=_matte_viewer_label(state)),
         state,
         gr.update(minimum=0, maximum=len(frame_paths) - 1, value=0, step=1, interactive=True),
         gr.update(minimum=0, maximum=len(frame_paths) - 1, value=0, step=1, interactive=True),
@@ -2707,6 +2888,451 @@ def _resolve_range(range_start, range_end, total_frames):
     return start, end
 
 
+# --- Matting backend plumbing ----------------------------------------------
+# Everything below is shared by both backends: where a matte is written, which
+# source ROI it is computed on, how its identity is recorded, and how it is
+# screened by QC. Only the two `_run_*_pass` functions differ per backend.
+
+
+def _matte_output_dirs(run_root: Path, custom_output_dir: str, spec):
+    """Resolve (preview_dir, alpha_dir) for one backend.
+
+    Each backend gets its own directory pair so two backends can coexist in a
+    run root and a comparison never overwrites the thing it is comparing to.
+    VideoMaMa keeps its historical names so runs already on disk stay resumable.
+    """
+    preview_name, alpha_name = spec.output_dirnames()
+    custom_output_dir = str(custom_output_dir or '').strip()
+    if not custom_output_dir:
+        return run_root / preview_name, run_root / alpha_name
+
+    output_dir = Path(custom_output_dir).expanduser()
+    if not output_dir.is_absolute():
+        output_dir = (REPO_ROOT / output_dir).resolve()
+    output_dir = output_dir.resolve()
+
+    if output_dir.name == preview_name:
+        return output_dir, output_dir.parent / alpha_name
+    if output_dir.name in {alpha_name, 'alpha_frames'}:
+        raise gr.Error(f'Custom matte output directory cannot be named {output_dir.name}.')
+    return output_dir, output_dir / alpha_name
+
+
+def _uniform_source_size(state):
+    """Return (width, height) when every frame shares a size, else None.
+
+    A single fixed ROI only makes sense across frames of one size; mixed-size
+    input falls back to full-frame processing rather than guessing.
+    """
+    sizes = {(int(width), int(height)) for width, height in state['frame_sizes']}
+    if len(sizes) != 1:
+        return None
+    return sizes.pop()
+
+
+def _full_frame_roi(source_width, source_height, reason='full frame'):
+    return {
+        'enabled': False,
+        'x': 0,
+        'y': 0,
+        'width': int(source_width),
+        'height': int(source_height),
+        'reason': reason,
+        'area_gain': 1.0,
+    }
+
+
+def _resolve_matte_roi(state, roi_mode, padding_ratio, min_area_gain, range_start, range_end):
+    """Decide the fixed source-space ROI the matting pass runs on.
+
+    Resolution order, highest priority first:
+      1. "Full frame"                 -> never crop.
+      2. A manual SAM ROI crop        -> the artist's explicit override wins.
+      3. "Auto (from SAM 3 masks)"    -> union of the generated masks over the
+                                         processed range, padded and stabilized.
+
+    The ROI is computed once per run and held fixed for the whole range, so the
+    sampling grid the model sees never moves. A per-frame ROI would be tighter
+    but makes hair edges crawl.
+    """
+    roi_mode = str(roi_mode or MATTE_ROI_MODES[0])
+    source_size = _uniform_source_size(state)
+    if source_size is None:
+        return _full_frame_roi(
+            state['frame_sizes'][0][0], state['frame_sizes'][0][1],
+            reason='mixed source frame sizes; ROI cropping disabled',
+        ), {'mode': roi_mode, 'applied': 'full-frame'}
+    source_width, source_height = source_size
+
+    if roi_mode == 'Full frame':
+        return _full_frame_roi(source_width, source_height, 'full frame requested'), {
+            'mode': roi_mode, 'applied': 'full-frame',
+        }
+
+    manual = dict(state.get('sam_crop_settings') or _sam_crop_settings())
+    if manual.get('enabled'):
+        try:
+            clamped = subject_roi.clamp_roi(manual, source_width, source_height)
+        except ValueError as exc:
+            raise gr.Error(str(exc)) from exc
+        clamped['reason'] = 'manual SAM ROI crop override'
+        clamped['area_gain'] = (source_width * source_height) / float(
+            max(1, clamped['width'] * clamped['height'])
+        )
+        return clamped, {'mode': roi_mode, 'applied': 'manual'}
+
+    if roi_mode != 'Auto (from SAM 3 masks)':
+        return _full_frame_roi(source_width, source_height, 'no manual ROI crop is enabled'), {
+            'mode': roi_mode, 'applied': 'full-frame',
+        }
+
+    masks_dir = Path(state.get('generated_masks_dir') or '')
+    if not masks_dir.is_dir():
+        return _full_frame_roi(source_width, source_height, 'no SAM 3 masks to derive a ROI from'), {
+            'mode': roi_mode, 'applied': 'full-frame',
+        }
+
+    def read_mask(path):
+        with Image.open(path) as image:
+            return np.array(image.convert('L'))
+
+    mask_paths = [
+        masks_dir / f"{Path(state['frame_names'][idx]).stem}.png"
+        for idx in range(range_start, range_end + 1)
+    ]
+    mask_paths = [path for path in mask_paths if path.is_file()]
+    roi = subject_roi.roi_from_mask_paths(
+        mask_paths, source_width, source_height, read_mask,
+        padding_ratio=float(padding_ratio),
+        min_area_gain=float(min_area_gain),
+    )
+    return roi, {
+        'mode': roi_mode,
+        'applied': 'auto' if roi.get('enabled') else 'full-frame',
+        'union_bbox': roi.get('union_bbox'),
+        'masks_sampled': len(mask_paths),
+    }
+
+
+def _roi_identity(roi):
+    """Only the geometry belongs in the cache key, not the human explanation."""
+    return {
+        'enabled': bool(roi.get('enabled')),
+        'x': int(roi.get('x', 0)),
+        'y': int(roi.get('y', 0)),
+        'width': int(roi.get('width', 0)),
+        'height': int(roi.get('height', 0)),
+    }
+
+
+def _qc_frame(state, frame_idx, alpha):
+    """Screen one frame by comparing the alpha's support against the SAM 3 mask."""
+    masks_dir = Path(state.get('generated_masks_dir') or '')
+    mask_path = masks_dir / f"{Path(state['frame_names'][frame_idx]).stem}.png"
+    if not mask_path.is_file():
+        return None
+    with Image.open(mask_path) as image:
+        mask = np.array(image.convert('L'))
+    return matte_qc.frame_metrics(
+        _qc_downsample(mask, nearest=True), _qc_downsample(alpha)
+    )
+
+
+def _matte_backend_status(spec, runtime):
+    if spec.family != 'sam2matting':
+        return (
+            f"{spec.label} (base {os.environ.get('VIDEOMAMA_BASE_MODEL_PATH', '?')}, "
+            f"unet {os.environ.get('VIDEOMAMA_UNET_CHECKPOINT_PATH', '?')})"
+        )
+    return (
+        f"{spec.label} [{spec.checkpoint_name}, upstream {str(runtime.get('commit', ''))[:12]}, "
+        f"torch {runtime.get('torch_version', '?')}]"
+    )
+
+
+class _MatteSink:
+    """Writes per-frame mattes, cross-fading the frames two passes both cover.
+
+    Both backends process a range in overlapping units (VideoMaMa chunks,
+    SAM2Matting windows). Frames inside an overlap are produced twice; holding
+    the first result back and blending it with the second removes the visible
+    seam. Only the overlap frames are ever buffered, so memory stays flat.
+    """
+
+    def __init__(self, output_dir, alpha_dir, frame_names, alpha_output_format,
+                 qc_enabled=False, qc_hook=None):
+        self.output_dir = Path(output_dir)
+        self.alpha_dir = Path(alpha_dir)
+        self.frame_names = frame_names
+        self.alpha_output_format = alpha_output_format
+        self.pending = {}
+        self.written = []
+        self.qc_enabled = bool(qc_enabled)
+        self.qc_hook = qc_hook
+        self.qc_metrics = {}
+
+    def hold(self, frame_idx, alpha):
+        self.pending[int(frame_idx)] = np.asarray(alpha, dtype=np.float32)
+
+    def blend_and_write(self, frame_idx, alpha, position, count):
+        blended = _blend_overlap_alpha(self.pending.pop(int(frame_idx)), alpha, position, count)
+        self.write(frame_idx, blended)
+
+    def write(self, frame_idx, alpha):
+        frame_idx = int(frame_idx)
+        alpha = np.clip(np.asarray(alpha, dtype=np.float32), 0.0, 1.0)
+        _save_matte_outputs(
+            self.output_dir, self.alpha_dir, self.frame_names[frame_idx],
+            alpha, self.alpha_output_format,
+        )
+        self.written.append(frame_idx)
+        if self.qc_enabled and self.qc_hook is not None:
+            metrics = self.qc_hook(frame_idx, alpha)
+            if metrics is not None:
+                self.qc_metrics[frame_idx] = metrics
+
+    def flush(self):
+        for frame_idx in sorted(self.pending):
+            self.write(frame_idx, self.pending[frame_idx])
+        self.pending.clear()
+
+
+def _run_videomama_pass(state, sink, roi, range_start, range_end, work_size,
+                        chunk_size, overlap, params, progress):
+    """The original chunked VideoMaMa matting loop, unchanged in behaviour.
+
+    Kept intact deliberately: it is the rescue/comparison path and must keep
+    producing exactly what it produced before SAM2Matting existed.
+    """
+    step = max(1, chunk_size - overlap)
+    processed = 0
+    source_width, source_height = _uniform_source_size(state) or (
+        state['frame_sizes'][0][0], state['frame_sizes'][0][1]
+    )
+
+    device = 'cuda' if _cuda_available() else 'cpu'
+    _unload_sam3_tracker()
+    pipeline = _ensure_videomama_pipeline(device)
+
+    chunk_starts = list(range(range_start, range_end + 1, step))
+    for chunk_number, start in enumerate(chunk_starts, start=1):
+        end = min(range_end + 1, start + chunk_size)
+        progress(
+            (chunk_number - 1, len(chunk_starts)),
+            desc=f"VideoMaMa chunk {chunk_number}/{len(chunk_starts)}: frames {start}-{end - 1}",
+        )
+        chunk_frame_names = state['frame_names'][start:end]
+        frame_indices = list(range(start, end))
+
+        source_frames_np = [_load_state_rgb_frame(state, idx) for idx in frame_indices]
+        source_masks_np = [_load_state_sam_mask(state, idx) for idx in frame_indices]
+
+        # Give VideoMaMa the same ROI the rest of the pipeline agreed on. On a
+        # 4K plate this preserves far more subject detail than shrinking the
+        # whole frame to the model canvas; the saved alpha is still full-frame.
+        model_frames_np = []
+        model_masks_np = []
+        model_refinement_masks_np = []
+        for source_frame, source_mask in zip(source_frames_np, source_masks_np):
+            model_frames_np.append(_crop_to_roi(source_frame, roi))
+            refinement_mask = _crop_to_roi(source_mask, roi)
+            model_refinement_masks_np.append(refinement_mask)
+            model_masks_np.append(
+                _expand_videomama_guide(refinement_mask, params.guide_expand_px)
+            )
+
+        output_frames = videomama(
+            pipeline,
+            model_frames_np,
+            model_masks_np,
+            seed=params.seed,
+            mask_cond_mode=params.mask_cond_mode,
+            fps=params.fps,
+            motion_bucket_id=params.motion_bucket_id,
+            noise_aug_strength=params.noise_aug_strength,
+            target_size=work_size,
+            frame_indices=frame_indices,
+        )
+        if len(output_frames) != len(chunk_frame_names):
+            raise RuntimeError(
+                f"VideoMaMa returned {len(output_frames)} outputs for a "
+                f"{len(chunk_frame_names)}-frame chunk."
+            )
+
+        chunk_alphas = []
+        for local_idx, output_frame in enumerate(output_frames):
+            alpha = np.asarray(output_frame, dtype=np.float32)
+            if alpha.ndim == 3:
+                alpha = alpha.mean(axis=2)
+            model_height, model_width = model_frames_np[local_idx].shape[:2]
+            alpha = _resize_alpha(alpha, (model_width, model_height))
+            if params.refine_edges_against_plate:
+                alpha = _refine_alpha_against_plate(
+                    model_frames_np[local_idx], alpha, model_refinement_masks_np[local_idx]
+                )
+            chunk_alphas.append(
+                _place_alpha_from_roi(alpha, roi, source_width, source_height)
+            )
+
+        leading_indices = [idx for idx in frame_indices if idx in sink.pending]
+        if leading_indices and leading_indices != frame_indices[:len(leading_indices)]:
+            raise RuntimeError('Unexpected non-contiguous VideoMaMa overlap window.')
+        for position, frame_idx in enumerate(leading_indices):
+            sink.blend_and_write(
+                frame_idx, chunk_alphas[frame_idx - start], position, len(leading_indices)
+            )
+            processed += 1
+
+        will_have_next_chunk = end < range_end + 1
+        tail_start = end - overlap if will_have_next_chunk else end
+        for local_idx in range(len(leading_indices), len(chunk_alphas)):
+            frame_idx = start + local_idx
+            if will_have_next_chunk and frame_idx >= tail_start:
+                sink.hold(frame_idx, chunk_alphas[local_idx])
+                continue
+            sink.write(frame_idx, chunk_alphas[local_idx])
+            processed += 1
+
+        _free_cuda_cache()
+        if end == range_end + 1:
+            break
+
+    progress((len(chunk_starts), len(chunk_starts)), desc='Writing final alpha frames')
+    pending_count = len(sink.pending)
+    sink.flush()
+    return processed + pending_count
+
+
+def _run_sam2matting_pass(state, sink, roi, range_start, range_end, spec, params,
+                          runtime, progress):
+    """Run SAM2Matting over the range in the isolated worker process.
+
+    SAM2Matting keeps one propagation state per window, so a window is the unit
+    of temporal memory — not a chunk of a diffusion batch. Windows are large by
+    default and overlap only enough to cross-fade the seam.
+    """
+    source_width, source_height = _uniform_source_size(state) or (
+        state['frame_sizes'][0][0], state['frame_sizes'][0][1]
+    )
+    frame_indices = list(range(range_start, range_end + 1))
+    windows = sam2matting_client.plan_windows(
+        frame_indices, params.window_size, params.window_overlap
+    )
+    keyframes = sorted(int(key) for key in (state.get('prompts_by_frame') or {}))
+    processed = 0
+
+    work_root = Path(state['run_root']) / f".sam2matting.{uuid.uuid4().hex}"
+    try:
+        for window_number, window in enumerate(windows, start=1):
+            window_start, window_end = window[0], window[-1]
+            next_window_start = (
+                windows[window_number][0] if window_number < len(windows) else None
+            )
+            # Conditioning always includes the window's own first frame: the
+            # predictor propagates outward from the earliest conditioned frame,
+            # and anchoring there keeps the stream monotonic and forward-only.
+            cond_global = mb.conditioning_frames(
+                params.conditioning, window_start, window_end, keyframes,
+                guidance_interval=params.guidance_interval,
+            )
+            progress(
+                (window_number - 1, len(windows)),
+                desc=(
+                    f"SAM2Matting window {window_number}/{len(windows)}: "
+                    f"frames {window_start}-{window_end} "
+                    f"({len(cond_global)} SAM 3 conditioning frame(s))"
+                ),
+            )
+            _append_debug_line(
+                f"SAM2Matting window {window_number}/{len(windows)} frames "
+                f"[{window_start}, {window_end}], conditioning on {cond_global[:12]}"
+                f"{'...' if len(cond_global) > 12 else ''}"
+            )
+
+            work_dir = work_root / f"window_{window_number:04d}"
+            staged = sam2matting_client.stage_window(
+                work_dir,
+                window,
+                lambda idx: _load_state_rgb_frame(state, idx),
+                lambda idx: _load_state_sam_mask(state, idx),
+                cond_global,
+                roi,
+                long_edge_cap=params.frame_long_edge_cap,
+            )
+            job = sam2matting_client.build_job(spec, params, runtime, staged)
+            # Frames this window shares with the previous one, in order. They
+            # were held back there and get cross-faded as they arrive here.
+            leading = [idx for idx in window if idx in sink.pending]
+            if leading and leading != window[:len(leading)]:
+                raise RuntimeError('Unexpected non-contiguous SAM2Matting window overlap.')
+            try:
+                for local_idx, alpha, _message in sam2matting_client.run_window(
+                    REPO_ROOT, job, runtime['python'], log=_append_debug_line
+                ):
+                    frame_idx = window[int(local_idx)]
+                    full_alpha = _place_alpha_from_roi(
+                        alpha, roi, source_width, source_height
+                    )
+                    del alpha
+                    if frame_idx in sink.pending:
+                        sink.blend_and_write(
+                            frame_idx, full_alpha, leading.index(frame_idx), len(leading)
+                        )
+                        processed += 1
+                    elif next_window_start is not None and frame_idx >= next_window_start:
+                        sink.hold(frame_idx, full_alpha)
+                    else:
+                        sink.write(frame_idx, full_alpha)
+                        processed += 1
+            finally:
+                sam2matting_client.cleanup_window(work_dir)
+    finally:
+        shutil.rmtree(work_root, ignore_errors=True)
+
+    progress((len(windows), len(windows)), desc='Writing final alpha frames')
+    pending_count = len(sink.pending)
+    sink.flush()
+    return processed + pending_count
+
+
+def _sam_masks_need_regen(state, sam_output_prob_thresh, saved_sam_manifest, expected_sam_manifest):
+    return (
+        not state.get('generated_masks_dir')
+        or not _sequence_outputs_complete(
+            Path(state.get('generated_masks_dir') or '.'), state['frame_names'], state['frame_sizes']
+        )
+        or state.get('generated_masks_sam_output_prob_thresh') is None
+        or abs(float(state['generated_masks_sam_output_prob_thresh']) - sam_output_prob_thresh) > 1e-6
+        or saved_sam_manifest.get('model_version') != expected_sam_manifest.get('model_version')
+        or saved_sam_manifest.get('keyframe_policy_version')
+            != expected_sam_manifest.get('keyframe_policy_version')
+        or saved_sam_manifest.get('prompt_hash') != expected_sam_manifest.get('prompt_hash')
+        or list(saved_sam_manifest.get('work_size') or []) != list(expected_sam_manifest.get('work_size') or [])
+        or dict(saved_sam_manifest.get('sam_crop_settings') or _sam_crop_settings())
+            != dict(expected_sam_manifest.get('sam_crop_settings') or _sam_crop_settings())
+        or bool(saved_sam_manifest.get('refine_edges_against_plate', False))
+            != bool(expected_sam_manifest.get('refine_edges_against_plate', True))
+    )
+
+
+def _read_matte_manifest(run_root: Path):
+    """Read the current matte section, falling back to pre-backend runs.
+
+    Runs written before backend selection existed stored their results under
+    'videomama'. They are still readable, but their settings hash predates the
+    backend identity, so they can never be mistaken for a new-format result.
+    """
+    manifest = _read_run_manifest(run_root)
+    if manifest.get('matte'):
+        return manifest['matte']
+    legacy = manifest.get('videomama') or {}
+    if legacy:
+        legacy = dict(legacy)
+        legacy.setdefault('backend_id', 'videomama')
+        legacy['schema'] = 'legacy'
+    return legacy
+
+
 @_serialized_gpu_job
 def run_sequence(state, chunk_size, overlap, range_start=0, range_end=-1, custom_output_dir='',
                  prompt_mode=None, concept_prompt=None, sam_output_prob_thresh=0.5,
@@ -2717,7 +3343,15 @@ def run_sequence(state, chunk_size, overlap, range_start=0, range_end=-1, custom
                  sam_crop_enabled=None, sam_crop_x=0, sam_crop_y=0,
                  sam_crop_width=0, sam_crop_height=0,
                  refine_edges_against_plate=False,
-                 free_gpu_after_run=False, alpha_output_format='16-bit PNG', progress=gr.Progress()):
+                 free_gpu_after_run=False, alpha_output_format='16-bit PNG',
+                 matting_backend=mb.DEFAULT_BACKEND_ID,
+                 matte_roi_mode=None, matte_roi_padding=DEFAULT_MATTE_ROI_PADDING,
+                 matte_roi_min_gain=DEFAULT_MATTE_ROI_MIN_GAIN,
+                 s2m_conditioning=None, s2m_guidance_interval=mb.DEFAULT_GUIDANCE_INTERVAL,
+                 s2m_frame_cap=2048, s2m_window_size=300, s2m_window_overlap=8,
+                 s2m_offload=True, s2m_bf16=True,
+                 matte_qc_enabled=True,
+                 progress=gr.Progress()):
     if state is None:
         raise gr.Error('Load a sequence first.')
     _ensure_loaded_processing_resolution(state, processing_resolution)
@@ -2729,43 +3363,29 @@ def run_sequence(state, chunk_size, overlap, range_start=0, range_end=-1, custom
     if concept_prompt is not None and (str(concept_prompt or '').strip() or not state.get('concept_prompt')):
         state['concept_prompt'] = str(concept_prompt or '').strip()
 
+    spec = mb.resolve_backend(matting_backend)
     sam_output_prob_thresh = _sam_output_prob_thresh(sam_output_prob_thresh)
     state['sam_output_prob_thresh'] = sam_output_prob_thresh
-    videomama_mask_cond_mode = str(videomama_mask_cond_mode or 'vae')
-    if videomama_mask_cond_mode not in {'vae', 'interpolate'}:
-        raise gr.Error(f"Unsupported VideoMaMa mask conditioning mode: {videomama_mask_cond_mode}")
-    videomama_seed = int(videomama_seed)
-    videomama_fps = max(1, int(videomama_fps))
-    videomama_motion_bucket_id = max(0, min(int(videomama_motion_bucket_id), 255))
-    videomama_noise_aug_strength = max(0.0, min(float(videomama_noise_aug_strength), 1.0))
-    videomama_guide_expand_px = _videomama_guide_expand_px(videomama_guide_expand_px)
-    refine_edges_against_plate = bool(refine_edges_against_plate)
     free_gpu_after_run = bool(free_gpu_after_run)
     alpha_output_format = str(alpha_output_format or '16-bit PNG')
     if alpha_output_format not in ALPHA_OUTPUT_FORMATS:
         raise gr.Error(f"Unsupported alpha output format: {alpha_output_format}")
 
-    generated_mask_thresh = state.get('generated_masks_sam_output_prob_thresh')
-    saved_sam_manifest = (_read_run_manifest(Path(state['run_root'])).get('sam3') or {})
+    videomama_mask_cond_mode = str(videomama_mask_cond_mode or 'vae')
+    if videomama_mask_cond_mode not in {'vae', 'interpolate'}:
+        raise gr.Error(f"Unsupported VideoMaMa mask conditioning mode: {videomama_mask_cond_mode}")
+
+    run_root = Path(state['run_root'])
+    total_frames = len(state['frame_paths'])
+    range_start, range_end = _resolve_range(range_start, range_end, total_frames)
+    is_subrange = not (range_start == 0 and range_end == total_frames - 1)
+    work_size = _work_size_from_state(state)
+
+    # SAM 3 masks are the input to every backend, so make sure they exist and
+    # match the current prompts before deciding anything about matting.
+    saved_sam_manifest = (_read_run_manifest(run_root).get('sam3') or {})
     expected_sam_manifest = _prompt_manifest_payload(state, sam_output_prob_thresh)
-    masks_need_regen = (
-        not state.get('generated_masks_dir')
-        or not _sequence_outputs_complete(
-            Path(state.get('generated_masks_dir') or '.'), state['frame_names'], state['frame_sizes']
-        )
-        or generated_mask_thresh is None
-        or abs(float(generated_mask_thresh) - sam_output_prob_thresh) > 1e-6
-        or saved_sam_manifest.get('model_version') != expected_sam_manifest.get('model_version')
-        or saved_sam_manifest.get('keyframe_policy_version')
-            != expected_sam_manifest.get('keyframe_policy_version')
-        or saved_sam_manifest.get('prompt_hash') != expected_sam_manifest.get('prompt_hash')
-        or list(saved_sam_manifest.get('work_size') or []) != list(expected_sam_manifest.get('work_size') or [])
-        or dict(saved_sam_manifest.get('sam_crop_settings') or _sam_crop_settings())
-            != dict(expected_sam_manifest.get('sam_crop_settings') or _sam_crop_settings())
-        or bool(saved_sam_manifest.get('refine_edges_against_plate', False))
-            != bool(expected_sam_manifest.get('refine_edges_against_plate', True))
-    )
-    if masks_need_regen:
+    if _sam_masks_need_regen(state, sam_output_prob_thresh, saved_sam_manifest, expected_sam_manifest):
         state = generate_sam3_masks(
             state,
             prompt_mode=state.get('prompt_mode'),
@@ -2773,265 +3393,135 @@ def run_sequence(state, chunk_size, overlap, range_start=0, range_end=-1, custom
             sam_output_prob_thresh=sam_output_prob_thresh,
             sam_refine_edges_against_plate=state.get('sam_refine_edges_against_plate', True),
         )[4]
-        saved_sam_manifest = (_read_run_manifest(Path(state['run_root'])).get('sam3') or {})
+        saved_sam_manifest = (_read_run_manifest(run_root).get('sam3') or {})
 
-    import torch
+    roi, roi_report = _resolve_matte_roi(
+        state, matte_roi_mode or MATTE_ROI_MODES[0],
+        matte_roi_padding, matte_roi_min_gain, range_start, range_end,
+    )
+    _append_debug_line(f"Matte ROI: {roi.get('reason')} -> {_roi_identity(roi)}")
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    _unload_sam3_tracker()
-    pipeline = _ensure_videomama_pipeline(device)
+    runtime = {}
+    if spec.family == 'sam2matting':
+        params = mb.SAM2MattingParams(
+            conditioning=mb.resolve_conditioning(s2m_conditioning),
+            guidance_interval=s2m_guidance_interval,
+            frame_long_edge_cap=s2m_frame_cap,
+            window_size=s2m_window_size,
+            window_overlap=s2m_window_overlap,
+            offload_video_to_cpu=bool(s2m_offload),
+            offload_state_to_cpu=bool(s2m_offload),
+            bf16=bool(s2m_bf16),
+        ).normalized()
+        try:
+            runtime = sam2matting_client.preflight(REPO_ROOT, spec, _checkpoints_root())
+        except sam2matting_client.SAM2MattingError as exc:
+            raise gr.Error(str(exc)) from exc
+        # The worker needs the whole GPU; nothing of ours may stay resident.
+        _unload_sam3_tracker()
+        _unload_videomama_pipeline()
+    else:
+        chunk_size = max(1, int(chunk_size))
+        overlap = max(0, int(overlap))
+        if overlap >= chunk_size:
+            overlap = max(0, chunk_size - 1)
+        # At most half a chunk keeps every frame in no more than two chunks,
+        # which makes the cross-fade unambiguous.
+        overlap = min(overlap, chunk_size // 2)
+        params = mb.VideoMaMaParams(
+            mask_cond_mode=videomama_mask_cond_mode,
+            seed=int(videomama_seed),
+            fps=max(1, int(videomama_fps)),
+            motion_bucket_id=max(0, min(int(videomama_motion_bucket_id), 255)),
+            noise_aug_strength=max(0.0, min(float(videomama_noise_aug_strength), 1.0)),
+            guide_expand_px=_videomama_guide_expand_px(videomama_guide_expand_px),
+            chunk_size=chunk_size,
+            overlap=overlap,
+            refine_edges_against_plate=bool(refine_edges_against_plate),
+            processing_size=tuple(work_size),
+        )
 
-    total_frames = len(state['frame_paths'])
-    range_start, range_end = _resolve_range(range_start, range_end, total_frames)
-    is_subrange = not (range_start == 0 and range_end == total_frames - 1)
-
-    chunk_size = max(1, int(chunk_size))
-    overlap = max(0, int(overlap))
-    if overlap >= chunk_size:
-        overlap = max(0, chunk_size - 1)
-    # Keeping overlap at most half a chunk ensures every frame belongs to no
-    # more than two adjacent chunks, which makes the cross-fade unambiguous.
-    overlap = min(overlap, chunk_size // 2)
-    step = max(1, chunk_size - overlap)
-
-    run_root = Path(state['run_root'])
-    work_size = _work_size_from_state(state)
-    output_dir, alpha_dir = _resolve_videomama_output_dirs(run_root, custom_output_dir)
+    output_dir, alpha_dir = _matte_output_dirs(run_root, custom_output_dir, spec)
     output_dir.mkdir(parents=True, exist_ok=True)
     alpha_dir.mkdir(parents=True, exist_ok=True)
 
-    processed = 0
-    written_indices = []
-    pending_overlap = {}
-    previous_videomama_manifest = (_read_run_manifest(run_root).get('videomama') or {})
-    candidate_prior_frame_records = {
-        str(index): record
-        for index, record in (previous_videomama_manifest.get('frame_records') or {}).items()
+    identity = mb.backend_identity(spec, params, runtime)
+    run_manifest = {
+        'schema': RUN_MANIFEST_SCHEMA,
+        'status': 'running',
+        'backend_id': spec.backend_id,
+        'backend_label': spec.label,
+        'range': [range_start, range_end],
+        'identity': identity,
+        'matte_roi': _roi_identity(roi),
+        'matte_roi_report': roi_report,
+        'processing_size': list(work_size),
+        'sam_prompt_hash': saved_sam_manifest.get('prompt_hash'),
+        'sam_keyframe_policy_version': saved_sam_manifest.get('keyframe_policy_version'),
+        'sam_output_prob_thresh': sam_output_prob_thresh,
+        'sam_crop_settings': dict(state.get('sam_crop_settings') or _sam_crop_settings()),
+        'alpha_output_format': alpha_output_format,
+        'output_dir': str(output_dir),
+        'alpha_dir': str(alpha_dir),
+    }
+    # Everything that can change a pixel goes into the hash; status/range/report
+    # do not, so a second range run can still reuse the first range's frames.
+    settings_hash = _stable_json_hash({
+        key: value for key, value in run_manifest.items()
+        if key not in {'status', 'range', 'matte_roi_report', 'schema'}
+    })
+
+    previous = _read_matte_manifest(run_root)
+    prior_frame_records = {
+        index: record
+        for index, record in (previous.get('frame_records') or {}).items()
         if str(index).isdigit()
         and 0 <= int(index) < total_frames
+        and record.get('settings_hash') == settings_hash
         and _matte_output_record_exists(
             output_dir, alpha_dir, state['frame_names'][int(index)], record
         )
     }
-    run_manifest = {
-        'status': 'running',
-        'range': [range_start, range_end],
-        'chunk_size': chunk_size,
-        'overlap': overlap,
-        'mask_cond_mode': videomama_mask_cond_mode,
-        'seed': videomama_seed,
-        'fps': videomama_fps,
-        'motion_bucket_id': videomama_motion_bucket_id,
-        'noise_aug_strength': videomama_noise_aug_strength,
-        'guide_expand_px': videomama_guide_expand_px,
-        'processing_size': list(work_size),
-        'sam_prompt_hash': saved_sam_manifest.get('prompt_hash'),
-        'sam_keyframe_policy_version': saved_sam_manifest.get('keyframe_policy_version'),
-        'sam_crop_settings': dict(state.get('sam_crop_settings') or _sam_crop_settings()),
-        'process_on_source_roi': bool((state.get('sam_crop_settings') or {}).get('enabled')),
-        'refine_edges_against_plate': refine_edges_against_plate,
-        'alpha_output_format': alpha_output_format,
-        'base_model_path': os.environ.get('VIDEOMAMA_BASE_MODEL_PATH', ''),
-        'unet_checkpoint_path': os.environ.get('VIDEOMAMA_UNET_CHECKPOINT_PATH', ''),
-        'output_dir': str(output_dir),
-        'alpha_dir': str(alpha_dir),
-    }
-    settings_hash = _stable_json_hash({
-        key: value for key, value in run_manifest.items() if key not in {'status', 'range'}
-    })
-    prior_frame_records = {
-        index: record
-        for index, record in candidate_prior_frame_records.items()
-        if record.get('settings_hash') == settings_hash
-    }
     run_manifest['settings_hash'] = settings_hash
     run_manifest['frame_records'] = prior_frame_records
-    _update_run_manifest(run_root, 'videomama', run_manifest)
+    _update_run_manifest(run_root, 'matte', run_manifest)
+
     print(
-        f"Running VideoMaMa over frames [{range_start}, {range_end}] "
-        f"({range_end - range_start + 1} of {total_frames}) with chunk_size={chunk_size}, overlap={overlap}, "
-        f"mask_cond_mode={videomama_mask_cond_mode}, seed={videomama_seed}, fps={videomama_fps}, "
-        f"motion_bucket_id={videomama_motion_bucket_id}, noise_aug_strength={videomama_noise_aug_strength:.4f}, "
-        f"guide_expand_px={videomama_guide_expand_px}, processing_size={work_size[0]}x{work_size[1]}, "
-        f"refine_edges={refine_edges_against_plate}"
+        f"Matting frames [{range_start}, {range_end}] ({range_end - range_start + 1} of "
+        f"{total_frames}) with backend={spec.backend_id}, roi={_roi_identity(roi)}, "
+        f"params={identity['params']}"
+    )
+
+    sink = _MatteSink(
+        output_dir, alpha_dir, state['frame_names'], alpha_output_format,
+        qc_enabled=bool(matte_qc_enabled),
+        qc_hook=lambda idx, alpha: _qc_frame(state, idx, alpha),
     )
     try:
-        # `end` is exclusive within the loop; the range is inclusive of range_end.
-        chunk_starts = list(range(range_start, range_end + 1, step))
-        for chunk_number, start in enumerate(chunk_starts, start=1):
-            end = min(range_end + 1, start + chunk_size)
-            progress(
-                (chunk_number - 1, len(chunk_starts)),
-                desc=f"VideoMaMa chunk {chunk_number}/{len(chunk_starts)}: frames {start}-{end - 1}",
+        if spec.family == 'sam2matting':
+            processed = _run_sam2matting_pass(
+                state, sink, roi, range_start, range_end, spec, params, runtime, progress
             )
-            chunk_frame_paths = state['frame_paths'][start:end]
-            chunk_frame_names = state['frame_names'][start:end]
-            frame_indices = list(range(start, end))
-
-            source_frames_np = [
-                _load_rgb_frame(
-                    frame_path,
-                    exr_gamma=state['exr_gamma'],
-                    exr_exposure=state.get('exr_exposure', 0.0),
-                    exr_color_mode=(state.get('exr_color_settings') or {}).get('mode', 'Gamma / Exposure'),
-                    ocio_input_colorspace=(state.get('exr_color_settings') or {}).get(
-                        'input_colorspace', 'scene_linear'
-                    ),
-                    ocio_display=(state.get('exr_color_settings') or {}).get('display', ''),
-                    ocio_view=(state.get('exr_color_settings') or {}).get('view', ''),
-                )
-                for frame_path in chunk_frame_paths
-            ]
-            source_masks_np = []
-            for frame_name in chunk_frame_names:
-                mask_path = Path(state['generated_masks_dir']) / f"{Path(frame_name).stem}.png"
-                if not mask_path.exists():
-                    raise gr.Error(f"Missing SAM 3 mask for {frame_name}: {mask_path}")
-                source_masks_np.append(np.array(Image.open(mask_path).convert('L')))
-
-            # If SAM was given a source ROI, give VideoMaMa the same crop. This
-            # preserves far more subject detail than shrinking the entire 4K
-            # frame to the model canvas, while final alpha is still full-frame.
-            model_frames_np = []
-            model_masks_np = []
-            model_refinement_masks_np = []
-            crop_transforms = []
-            for local_idx, (source_frame, source_mask) in enumerate(
-                zip(source_frames_np, source_masks_np)
-            ):
-                transform = (state.get('frame_transforms') or [{}])[start + local_idx]
-                crop_transforms.append(transform)
-                if transform.get('crop_enabled'):
-                    crop_x = int(transform['crop_x'])
-                    crop_y = int(transform['crop_y'])
-                    crop_width = int(transform['crop_width'])
-                    crop_height = int(transform['crop_height'])
-                    model_frames_np.append(
-                        source_frame[crop_y:crop_y + crop_height, crop_x:crop_x + crop_width]
-                    )
-                    refinement_mask = source_mask[
-                        crop_y:crop_y + crop_height, crop_x:crop_x + crop_width
-                    ]
-                else:
-                    model_frames_np.append(source_frame)
-                    refinement_mask = source_mask
-                model_refinement_masks_np.append(refinement_mask)
-                model_masks_np.append(
-                    _expand_videomama_guide(refinement_mask, videomama_guide_expand_px)
-                )
-
-            output_frames = videomama(
-                pipeline,
-                model_frames_np,
-                model_masks_np,
-                seed=videomama_seed,
-                mask_cond_mode=videomama_mask_cond_mode,
-                fps=videomama_fps,
-                motion_bucket_id=videomama_motion_bucket_id,
-                noise_aug_strength=videomama_noise_aug_strength,
-                target_size=work_size,
-                frame_indices=frame_indices,
+        else:
+            processed = _run_videomama_pass(
+                state, sink, roi, range_start, range_end, work_size,
+                params.chunk_size, params.overlap, params, progress
             )
-            if len(output_frames) != len(chunk_frame_names):
-                raise RuntimeError(
-                    f"VideoMaMa returned {len(output_frames)} outputs for a {len(chunk_frame_names)}-frame chunk."
-                )
-
-            chunk_alphas = []
-            for local_idx, output_frame in enumerate(output_frames):
-                alpha = np.asarray(output_frame, dtype=np.float32)
-                if alpha.ndim == 3:
-                    alpha = alpha.mean(axis=2)
-                model_height, model_width = model_frames_np[local_idx].shape[:2]
-                if alpha.shape != (model_height, model_width):
-                    alpha = np.array(
-                        Image.fromarray(alpha, mode='F').resize(
-                            (model_width, model_height), Image.Resampling.BICUBIC
-                        ),
-                        dtype=np.float32,
-                    )
-                if refine_edges_against_plate:
-                    alpha = _refine_alpha_against_plate(
-                        model_frames_np[local_idx], alpha, model_refinement_masks_np[local_idx]
-                    )
-                transform = crop_transforms[local_idx]
-                if transform.get('crop_enabled'):
-                    source_height, source_width = source_frames_np[local_idx].shape[:2]
-                    full_alpha = np.zeros((source_height, source_width), dtype=np.float32)
-                    crop_x = int(transform['crop_x'])
-                    crop_y = int(transform['crop_y'])
-                    crop_width = int(transform['crop_width'])
-                    crop_height = int(transform['crop_height'])
-                    full_alpha[crop_y:crop_y + crop_height, crop_x:crop_x + crop_width] = alpha
-                    alpha = full_alpha
-                chunk_alphas.append(np.clip(alpha, 0.0, 1.0).astype(np.float32))
-
-            leading_indices = [idx for idx in frame_indices if idx in pending_overlap]
-            if leading_indices and leading_indices != frame_indices[:len(leading_indices)]:
-                raise RuntimeError('Unexpected non-contiguous VideoMaMa overlap window.')
-            for position, frame_idx in enumerate(leading_indices):
-                local_idx = frame_idx - start
-                blended = _blend_overlap_alpha(
-                    pending_overlap.pop(frame_idx), chunk_alphas[local_idx], position, len(leading_indices)
-                )
-                _save_matte_outputs(
-                    output_dir, alpha_dir, state['frame_names'][frame_idx], blended, alpha_output_format
-                )
-                written_indices.append(frame_idx)
-                processed += 1
-
-            will_have_next_chunk = end < range_end + 1
-            tail_start = end - overlap if will_have_next_chunk else end
-            for local_idx in range(len(leading_indices), len(chunk_alphas)):
-                frame_idx = start + local_idx
-                alpha = chunk_alphas[local_idx]
-                if will_have_next_chunk and frame_idx >= tail_start:
-                    pending_overlap[frame_idx] = alpha
-                    continue
-                _save_matte_outputs(
-                    output_dir, alpha_dir, state['frame_names'][frame_idx], alpha, alpha_output_format
-                )
-                written_indices.append(frame_idx)
-                processed += 1
-
-            _free_cuda_cache()
-            if end == range_end + 1:
-                break
-
-        progress((len(chunk_starts), len(chunk_starts)), desc="Writing final alpha frames")
-
-        if pending_overlap:
-            for frame_idx in sorted(pending_overlap):
-                _save_matte_outputs(
-                    output_dir, alpha_dir, state['frame_names'][frame_idx],
-                    pending_overlap[frame_idx], alpha_output_format,
-                )
-                written_indices.append(frame_idx)
-                processed += 1
-            pending_overlap.clear()
 
         expected_indices = list(range(range_start, range_end + 1))
-        if sorted(written_indices) != expected_indices:
+        if sorted(sink.written) != expected_indices:
             raise RuntimeError(
-                f"VideoMaMa wrote unexpected frame indices: expected {expected_indices[0]}-{expected_indices[-1]}, "
-                f"got {sorted(written_indices)}."
+                f"{spec.label} wrote unexpected frame indices: expected "
+                f"{expected_indices[0]}-{expected_indices[-1]}, got {sorted(sink.written)}."
             )
+    except sam2matting_client.SAM2MattingError as exc:
+        _record_failed_matte(run_root, run_manifest, prior_frame_records, sink,
+                             settings_hash, alpha_output_format, exc)
+        _free_cuda_cache()
+        raise gr.Error(_sam2matting_error_help(exc)) from exc
     except Exception as exc:
-        failed_records = dict(prior_frame_records)
-        for frame_idx in written_indices:
-            failed_records[str(frame_idx)] = {
-                'settings_hash': settings_hash,
-                'status': 'complete',
-                'alpha_output_format': alpha_output_format,
-            }
-        failed_manifest = dict(run_manifest)
-        failed_manifest.update({
-            'status': 'failed',
-            'error': str(exc),
-            'frame_records': failed_records,
-            'completed_frame_indices': sorted(int(index) for index in failed_records),
-        })
-        _update_run_manifest(run_root, 'videomama', failed_manifest)
+        _record_failed_matte(run_root, run_manifest, prior_frame_records, sink,
+                             settings_hash, alpha_output_format, exc)
         _free_cuda_cache()
         if free_gpu_after_run:
             _unload_videomama_pipeline()
@@ -3039,12 +3529,13 @@ def run_sequence(state, chunk_size, overlap, range_start=0, range_end=-1, custom
 
     frame_records = dict(prior_frame_records)
     completed_at = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
-    for frame_idx in written_indices:
+    for frame_idx in sink.written:
         frame_records[str(frame_idx)] = {
             'settings_hash': settings_hash,
             'status': 'complete',
             'completed_at': completed_at,
             'alpha_output_format': alpha_output_format,
+            'backend_id': spec.backend_id,
         }
     complete_manifest = dict(run_manifest)
     complete_manifest.update({
@@ -3053,25 +3544,82 @@ def run_sequence(state, chunk_size, overlap, range_start=0, range_end=-1, custom
         'completed_frame_indices': sorted(int(index) for index in frame_records),
         'completed_at': completed_at,
     })
-    _update_run_manifest(run_root, 'videomama', complete_manifest)
 
+    qc_message = ''
+    if sink.qc_metrics:
+        summary = matte_qc.summarize(sink.qc_metrics)
+        complete_manifest['qc'] = summary
+        _write_json_atomic(run_root / f"matte_qc_{spec.output_slug}.json", {
+            'backend_id': spec.backend_id,
+            'settings_hash': settings_hash,
+            'range': [range_start, range_end],
+            'summary': summary,
+            'per_frame': {str(k): v for k, v in sorted(sink.qc_metrics.items())},
+        })
+        qc_message = ' ' + matte_qc.status_line(summary)
+
+    _update_run_manifest(run_root, 'matte', complete_manifest)
+    # Mirror to the legacy section so older resume paths keep working when the
+    # VideoMaMa backend is what produced the frames.
+    if spec.family == 'videomama':
+        _update_run_manifest(run_root, 'videomama', complete_manifest)
+
+    state['matte_backend_id'] = spec.backend_id
+    state['matte_output_dir'] = str(output_dir)
+    state['matte_alpha_dir'] = str(alpha_dir)
     state['videomama_output_dir'] = str(output_dir)
     state['alpha_output_dir'] = str(alpha_dir)
     if free_gpu_after_run:
         _unload_sam3_tracker()
         _unload_videomama_pipeline()
-    # Jump the viewer to the start of what was just processed.
+    _free_cuda_cache()
     state['current_frame_idx'] = range_start
     scope = f"frames [{range_start}, {range_end}]" if is_subrange else "the whole sequence"
     return _ui_state_payload(
         state,
-        f"Saved VideoMaMa outputs for {scope} ({processed} frame(s) written) to {output_dir}. "
-        f"VideoMaMa: {videomama_mask_cond_mode}, seed {videomama_seed}, fps {videomama_fps}, "
-        f"motion bucket {videomama_motion_bucket_id}, noise {videomama_noise_aug_strength:.4f}, "
-        f"guide margin {videomama_guide_expand_px}px, processing {work_size[0]}x{work_size[1]}, "
-        f"edge refine {refine_edges_against_plate}, "
-        f"alpha {alpha_output_format}, overlap cross-fade {overlap}, free GPU after run {free_gpu_after_run}.",
+        f"Saved {spec.label} mattes for {scope} ({processed} frame(s) written) to {output_dir}. "
+        f"{_matte_backend_status(spec, runtime)}; ROI {roi.get('reason')}; "
+        f"alpha {alpha_output_format}; free GPU after run {free_gpu_after_run}.{qc_message}",
     )
+
+
+def _record_failed_matte(run_root, run_manifest, prior_frame_records, sink,
+                         settings_hash, alpha_output_format, exc):
+    """Persist whatever completed before the failure so a resume can skip it."""
+    failed_records = dict(prior_frame_records)
+    for frame_idx in sink.written:
+        failed_records[str(frame_idx)] = {
+            'settings_hash': settings_hash,
+            'status': 'complete',
+            'alpha_output_format': alpha_output_format,
+            'backend_id': run_manifest.get('backend_id'),
+        }
+    failed_manifest = dict(run_manifest)
+    failed_manifest.update({
+        'status': 'failed',
+        'error': str(exc),
+        'frame_records': failed_records,
+        'completed_frame_indices': sorted(int(index) for index in failed_records),
+    })
+    _update_run_manifest(Path(run_root), 'matte', failed_manifest)
+
+
+def _sam2matting_error_help(exc):
+    """Turn a worker failure into something an artist can act on."""
+    base = str(exc)
+    if getattr(exc, 'kind', '') == 'oom':
+        return (
+            f"{base}\n\nSAM2Matting ran out of GPU memory. Try, in order: keep CPU "
+            "offload enabled, lower 'SAM2Matting Frame Cap', lower 'SAM2Matting "
+            "Window Size', tighten the matte ROI, or switch to the Tiny variant."
+        )
+    if getattr(exc, 'kind', '') == 'setup':
+        return base
+    detail = str(getattr(exc, 'detail', '') or '').strip()
+    lines = [line for line in detail.splitlines() if line.strip() and line.strip() not in base]
+    tail = ('\n\n' + lines[-1]) if lines else ''
+    return f"{base}{tail}"
+
 
 
 with gr.Blocks(title='VideoMaMa Production Sequence App', css=APP_CSS, js=APP_JS) as demo:
@@ -3081,6 +3629,10 @@ with gr.Blocks(title='VideoMaMa Production Sequence App', css=APP_CSS, js=APP_JS
     crop_selector_state = gr.State(None)
 
     _settings = _load_ui_settings()
+    # Apply the restored tracking model before anything can build a tracker, so
+    # the first run uses the artist's last choice rather than the process default.
+    os.environ.setdefault('SAM3_MODEL_VERSION', 'sam3')
+    os.environ['SAM3_MODEL_VERSION'] = str(_settings['tracking_model'])
 
     status = gr.Textbox(label='Status', interactive=False)
 
@@ -3157,7 +3709,8 @@ with gr.Blocks(title='VideoMaMa Production Sequence App', css=APP_CSS, js=APP_JS
                     label='Combined SAM 3 + VideoMaMa Quality Preset',
                     info=(
                         'Hair Detail preserves SAM flyaways, runs at 2048x1152, and gives VideoMaMa '
-                        'a small context margin. Reload the sequence after changing preset resolution.'
+                        'a small context margin. Reload the sequence after changing preset resolution. '
+                        'Presets tune SAM 3 and VideoMaMa only; SAM2Matting has its own settings below.'
                     ),
                 )
                 gr.Markdown(
@@ -3222,6 +3775,98 @@ with gr.Blocks(title='VideoMaMa Production Sequence App', css=APP_CSS, js=APP_JS
                     )
 
             with gr.Group():
+                tracking_model = gr.Dropdown(
+                    list(TRACKING_MODELS),
+                    value=_settings['tracking_model'],
+                    label='Tracking Model (SAM 3)',
+                    info=(
+                        'Which SAM 3 weights do the prompting and propagation. '
+                        'Both are gated on Hugging Face and need their own access grant.'
+                    ),
+                )
+                matting_backend = gr.Dropdown(
+                    mb.backend_labels(),
+                    value=_settings['matting_backend'],
+                    label='Matting Backend',
+                    info=(
+                        'SAM 3 always does tracking. This chooses what turns the tracked '
+                        'mask into alpha. SAM2Matting runs in its own isolated process.'
+                    ),
+                )
+                backend_info = gr.Markdown(_backend_info_markdown(_settings['matting_backend']))
+                matte_roi_mode = gr.Radio(
+                    list(MATTE_ROI_MODES),
+                    value=_settings['matte_roi_mode'],
+                    label='Matte ROI',
+                    info=(
+                        'Auto derives one fixed source-space ROI from the generated SAM 3 '
+                        'masks. An enabled manual SAM ROI crop always overrides it.'
+                    ),
+                )
+                with gr.Row():
+                    matte_roi_padding = gr.Slider(
+                        label='Matte ROI Padding',
+                        minimum=0.0, maximum=0.6, step=0.01,
+                        value=_settings['matte_roi_padding'],
+                        info='Margin as a fraction of the subject box; hair lives outside the mask.',
+                    )
+                    matte_roi_min_gain = gr.Slider(
+                        label='Matte ROI Minimum Gain',
+                        minimum=1.0, maximum=4.0, step=0.05,
+                        value=_settings['matte_roi_min_gain'],
+                        info='Below this area saving, the ROI is dropped and the full frame is used.',
+                    )
+                with gr.Accordion('SAM2Matting Settings', open=True):
+                    s2m_conditioning = gr.Dropdown(
+                        list(mb.CONDITIONING_STRATEGIES.keys()),
+                        value=_settings['s2m_conditioning'],
+                        label='SAM 3 Conditioning',
+                        info=(
+                            'How often the SAM 3 mask re-anchors SAM2Matting. Artist keyframes '
+                            'always condition; this controls the guidance in between.'
+                        ),
+                    )
+                    with gr.Row():
+                        s2m_guidance_interval = gr.Slider(
+                            label='Guidance Interval (frames)',
+                            minimum=1, maximum=96, step=1,
+                            value=_settings['s2m_guidance_interval'],
+                        )
+                        s2m_frame_cap = gr.Slider(
+                            label='Frame Cap (long edge px)',
+                            minimum=512, maximum=4096, step=64,
+                            value=_settings['s2m_frame_cap'],
+                            info='ROI frames are staged at this cap. Inference is 1024px square regardless.',
+                        )
+                    with gr.Row():
+                        s2m_window_size = gr.Number(
+                            label='Window Size (0 = whole range)',
+                            value=_settings['s2m_window_size'], precision=0,
+                        )
+                        s2m_window_overlap = gr.Number(
+                            label='Window Overlap',
+                            value=_settings['s2m_window_overlap'], precision=0,
+                        )
+                    with gr.Row():
+                        s2m_offload = gr.Checkbox(
+                            label='CPU Offload (video + state)',
+                            value=_settings['s2m_offload'],
+                            info='Keep enabled on a 24 GB L4; costs some speed, avoids OOM.',
+                        )
+                        s2m_bf16 = gr.Checkbox(
+                            label='BF16 Inference', value=_settings['s2m_bf16'],
+                        )
+                    gr.Markdown(
+                        'SAM2Matting predicts soft boundaries itself, so the GrabCut / guided-filter '
+                        'refinements above are **not** applied to its output.'
+                    )
+                matte_qc_enabled = gr.Checkbox(
+                    label='Run Matte QC',
+                    value=_settings['matte_qc_enabled'],
+                    info='Compares each alpha against its SAM 3 mask and lists suspicious ranges.',
+                )
+
+            with gr.Group():
                 with gr.Row():
                     chunk_size = gr.Number(label='Chunk Size', value=_settings['chunk_size'], precision=0)
                     overlap = gr.Number(label='Overlap', value=_settings['overlap'], precision=0)
@@ -3237,10 +3882,10 @@ with gr.Blocks(title='VideoMaMa Production Sequence App', css=APP_CSS, js=APP_JS
                     value=_settings['alpha_output_format'],
                     label='Alpha Output Format',
                 )
-                run_btn = gr.Button('Run VideoMaMa', variant='primary')
+                run_btn = gr.Button('Generate Matte (Selected Range)', variant='primary')
                 unload_models_btn = gr.Button('Unload Models / Free GPU')
                 mask_dir = gr.Textbox(label='Mask Directory', interactive=False)
-                output_dir = gr.Textbox(label='VideoMaMa Output Directory', interactive=False)
+                output_dir = gr.Textbox(label='Matte Output Directory', interactive=False)
 
             with gr.Accordion('Debug Console', open=False):
                 debug_console = gr.Textbox(
@@ -3337,9 +3982,9 @@ with gr.Blocks(title='VideoMaMa Production Sequence App', css=APP_CSS, js=APP_JS
                         elem_id='sam_mask_zoom',
                         elem_classes=['accurate-preview', 'sam-inspector'],
                     )
-                with gr.Tab('VideoMaMa'):
+                with gr.Tab('Matte'):
                     output_img = gr.Image(
-                        label='Current VideoMaMa Output',
+                        label='Current Matte (none generated yet)',
                         type='numpy',
                         format='png',
                         height=_settings['sam_preview_height'],
@@ -3384,7 +4029,11 @@ with gr.Blocks(title='VideoMaMa Production Sequence App', css=APP_CSS, js=APP_JS
         videomama_seed, videomama_fps, videomama_motion_bucket_id,
         videomama_noise_aug_strength, videomama_guide_expand_px, processing_resolution,
         sam_crop_enabled, sam_crop_x, sam_crop_y, sam_crop_width, sam_crop_height,
-        refine_edges_against_plate, free_gpu_after_run, alpha_output_format, chunk_size, overlap,
+        refine_edges_against_plate,
+        tracking_model, matting_backend, matte_roi_mode, matte_roi_padding, matte_roi_min_gain,
+        s2m_conditioning, s2m_guidance_interval, s2m_frame_cap,
+        s2m_window_size, s2m_window_overlap, s2m_offload, s2m_bf16, matte_qc_enabled,
+        free_gpu_after_run, alpha_output_format, chunk_size, overlap,
         custom_output_dir, resume_from_tmp, range_start, range_end,
     ]
     for _component in settings_inputs:
@@ -3568,8 +4217,23 @@ with gr.Blocks(title='VideoMaMa Production Sequence App', css=APP_CSS, js=APP_JS
             sam_crop_enabled, sam_crop_x, sam_crop_y, sam_crop_width, sam_crop_height,
             refine_edges_against_plate, free_gpu_after_run,
             alpha_output_format,
+            matting_backend, matte_roi_mode, matte_roi_padding, matte_roi_min_gain,
+            s2m_conditioning, s2m_guidance_interval, s2m_frame_cap,
+            s2m_window_size, s2m_window_overlap, s2m_offload, s2m_bf16,
+            matte_qc_enabled,
         ],
         outputs=ui_outputs,
+    )
+    tracking_model.change(
+        set_tracking_model,
+        inputs=tracking_model,
+        outputs=[status, debug_console],
+    )
+    matting_backend.change(
+        _backend_info_markdown,
+        inputs=matting_backend,
+        outputs=backend_info,
+        queue=False,
     )
 
 

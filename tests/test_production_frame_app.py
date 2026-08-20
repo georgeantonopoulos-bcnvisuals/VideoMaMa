@@ -722,6 +722,7 @@ class WrapperContractTests(unittest.TestCase):
                     range_start=0,
                     range_end=5,
                     alpha_output_format="16-bit PNG",
+                    matting_backend="videomama",
                 )
 
             output_state = payload[4]
@@ -792,7 +793,8 @@ class WrapperContractTests(unittest.TestCase):
                     mock.patch.object(app, '_ensure_videomama_pipeline', return_value=object()), \
                     mock.patch.object(app, 'videomama', side_effect=fake_videomama):
                 payload = app.run_sequence(
-                    state, chunk_size=1, overlap=0, videomama_guide_expand_px=2
+                    state, chunk_size=1, overlap=0, videomama_guide_expand_px=2,
+                    matting_backend="videomama",
                 )
 
             self.assertEqual(received_shapes, [((16, 16, 3), (16, 16))])
@@ -806,7 +808,13 @@ class WrapperContractTests(unittest.TestCase):
             self.assertEqual(int(alpha[24:].sum()), 0)
             self.assertEqual(int(alpha[:, 24:].sum()), 0)
             manifest = app._read_run_manifest(root / 'run')['videomama']
-            self.assertEqual(manifest['guide_expand_px'], 2)
+            self.assertEqual(manifest['backend_id'], 'videomama')
+            self.assertEqual(manifest['identity']['params']['guide_expand_px'], 2)
+            # The manual SAM ROI crop still overrides the automatic matte ROI.
+            self.assertEqual(
+                manifest['matte_roi'],
+                {'enabled': True, 'x': 8, 'y': 8, 'width': 16, 'height': 16},
+            )
 
 
 if __name__ == "__main__":

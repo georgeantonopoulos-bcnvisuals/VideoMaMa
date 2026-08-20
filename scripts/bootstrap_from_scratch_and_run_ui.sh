@@ -21,7 +21,7 @@
 #   ALLOW_NO_HF_AUTH=1                      # launch UI even if SAM 3 auth is missing
 #   REQUIRE_CUDA=0                          # skip CUDA preflight for non-GPU testing
 #   SKIP_LAUNCH=1                           # build only
-#   INSTALL_INFERENCE=1                     # also build /tmp/videomama-venv
+#   INSTALL_INFERENCE=1                     # also build ${VIDEOMAMA_VENV_ROOT:-/mnt/temporal/VideoMama}/videomama-venv
 
 set -euo pipefail
 
@@ -171,7 +171,7 @@ login_huggingface_if_requested() {
     return 0
   fi
 
-  local hf_bin="${VIDEOMAMA_UI_VENV:-/tmp/videomama-sam3-ui-venv}/bin/hf"
+  local hf_bin="${VIDEOMAMA_UI_VENV:-${VIDEOMAMA_VENV_ROOT:-/mnt/temporal/VideoMama}/videomama-sam3-ui-venv}/bin/hf"
   if [[ ! -x "${hf_bin}" ]]; then
     echo "Cannot find Hugging Face CLI at ${hf_bin}" >&2
     exit 1
@@ -182,7 +182,7 @@ login_huggingface_if_requested() {
 }
 
 verify_ui_environment() {
-  local py="${VIDEOMAMA_UI_VENV:-/tmp/videomama-sam3-ui-venv}/bin/python"
+  local py="${VIDEOMAMA_UI_VENV:-${VIDEOMAMA_VENV_ROOT:-/mnt/temporal/VideoMama}/videomama-sam3-ui-venv}/bin/python"
   log "Verifying UI Python imports."
   "${py}" -c "import bz2, ctypes, torch, torchvision, gradio, cv2, OpenEXR, sam3; print('ui_imports_ok')"
 
@@ -195,7 +195,7 @@ verify_cuda_available() {
     return 0
   fi
 
-  local py="${VIDEOMAMA_UI_VENV:-/tmp/videomama-sam3-ui-venv}/bin/python"
+  local py="${VIDEOMAMA_UI_VENV:-${VIDEOMAMA_VENV_ROOT:-/mnt/temporal/VideoMama}/videomama-sam3-ui-venv}/bin/python"
   log "Checking CUDA visibility for SAM 3."
   "${py}" -c "import torch, sys; sys.exit(0 if torch.cuda.is_available() and torch.cuda.device_count() > 0 else 1)" || {
     echo "CUDA is not visible to PyTorch in ${py}; SAM 3 model initialization cannot work." >&2
@@ -209,8 +209,8 @@ verify_huggingface_sam3_access() {
     return 0
   fi
 
-  local hf_bin="${VIDEOMAMA_UI_VENV:-/tmp/videomama-sam3-ui-venv}/bin/hf"
-  local py="${VIDEOMAMA_UI_VENV:-/tmp/videomama-sam3-ui-venv}/bin/python"
+  local hf_bin="${VIDEOMAMA_UI_VENV:-${VIDEOMAMA_VENV_ROOT:-/mnt/temporal/VideoMama}/videomama-sam3-ui-venv}/bin/hf"
+  local py="${VIDEOMAMA_UI_VENV:-${VIDEOMAMA_VENV_ROOT:-/mnt/temporal/VideoMama}/videomama-sam3-ui-venv}/bin/python"
   local model_version="${SAM3_MODEL_VERSION:-sam3}"
   local repo_id="facebook/sam3"
   if [[ "${model_version}" == "sam3.1" ]]; then
