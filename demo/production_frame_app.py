@@ -65,7 +65,7 @@ except OSError:
 
 import gradio as gr
 import numpy as np
-from PIL import Image, ImageFilter
+from PIL import Image, ImageDraw, ImageFilter
 
 try:
     import OpenEXR
@@ -97,7 +97,8 @@ EXR_COLOR_MODES = ('Gamma / Exposure', 'OCIO Display')
 WORK_WIDTH = 1024
 WORK_HEIGHT = 576
 DEFAULT_PROCESSING_RESOLUTION = f"{WORK_WIDTH}x{WORK_HEIGHT}"
-SAM_CACHE_VERSION = 2
+SAM_CACHE_VERSION = 3
+SAM_KEYFRAME_POLICY_VERSION = 2
 PROCESSING_RESOLUTIONS = {
     "1024x576": (1024, 576),
     "1280x720 (experimental)": (1280, 720),
@@ -141,7 +142,13 @@ DEFAULT_SETTINGS = {
     'videomama_fps': 7,
     'videomama_motion_bucket_id': 127,
     'videomama_noise_aug_strength': 0.0,
+    'videomama_guide_expand_px': 0,
     'processing_resolution': DEFAULT_PROCESSING_RESOLUTION,
+    'sam_crop_enabled': False,
+    'sam_crop_x': 0,
+    'sam_crop_y': 0,
+    'sam_crop_width': 0,
+    'sam_crop_height': 0,
     'refine_edges_against_plate': False,
     'free_gpu_after_run': True,
     'alpha_output_format': '16-bit PNG',
@@ -160,6 +167,10 @@ QUALITY_PRESETS = {
         'videomama_fps': 7,
         'videomama_motion_bucket_id': 127,
         'videomama_noise_aug_strength': 0.0,
+        'processing_resolution': '1024x576',
+        'sam_refine_edges_against_plate': True,
+        'videomama_guide_expand_px': 0,
+        'refine_edges_against_plate': True,
     },
     'Fine Detail': {
         'sam_output_prob_thresh': 0.35,
@@ -167,6 +178,10 @@ QUALITY_PRESETS = {
         'videomama_fps': 7,
         'videomama_motion_bucket_id': 127,
         'videomama_noise_aug_strength': 0.0,
+        'processing_resolution': '1536x864 (experimental)',
+        'sam_refine_edges_against_plate': True,
+        'videomama_guide_expand_px': 0,
+        'refine_edges_against_plate': True,
     },
     'Tight Matte': {
         'sam_output_prob_thresh': 0.65,
@@ -174,6 +189,34 @@ QUALITY_PRESETS = {
         'videomama_fps': 7,
         'videomama_motion_bucket_id': 127,
         'videomama_noise_aug_strength': 0.0,
+        'processing_resolution': '1536x864 (experimental)',
+        'sam_refine_edges_against_plate': True,
+        'videomama_guide_expand_px': 0,
+        'refine_edges_against_plate': True,
+    },
+    'Maximum Detail': {
+        'sam_output_prob_thresh': 0.35,
+        'videomama_mask_cond_mode': 'vae',
+        'videomama_fps': 7,
+        'videomama_motion_bucket_id': 127,
+        'videomama_noise_aug_strength': 0.0,
+        'processing_resolution': '2048x1152 (experimental)',
+        'sam_refine_edges_against_plate': True,
+        'videomama_guide_expand_px': 0,
+        'refine_edges_against_plate': True,
+    },
+    'Hair Detail': {
+        'sam_output_prob_thresh': 0.2,
+        'videomama_mask_cond_mode': 'vae',
+        'videomama_fps': 7,
+        'videomama_motion_bucket_id': 127,
+        'videomama_noise_aug_strength': 0.0,
+        'processing_resolution': '2048x1152 (experimental)',
+        # GrabCut and the final guided filter both simplify thin, irregular
+        # boundaries. Preserve SAM's raw contour for wisps and flyaways.
+        'sam_refine_edges_against_plate': False,
+        'videomama_guide_expand_px': 8,
+        'refine_edges_against_plate': False,
     },
     'Custom': {},
 }
@@ -605,7 +648,8 @@ def _save_ui_settings(sequence_dir, exr_gamma, exr_exposure, exr_color_mode,
                       sam_refine_edges_against_plate,
                       videomama_mask_cond_mode,
                       videomama_seed, videomama_fps, videomama_motion_bucket_id,
-                      videomama_noise_aug_strength, processing_resolution,
+                      videomama_noise_aug_strength, videomama_guide_expand_px, processing_resolution,
+                      sam_crop_enabled, sam_crop_x, sam_crop_y, sam_crop_width, sam_crop_height,
                       refine_edges_against_plate, free_gpu_after_run, alpha_output_format, chunk_size, overlap,
                       custom_output_dir, resume_from_tmp, range_start, range_end):
     """Persist the current input panel so the next launch restores it."""
@@ -631,7 +675,13 @@ def _save_ui_settings(sequence_dir, exr_gamma, exr_exposure, exr_color_mode,
         'videomama_fps': int(videomama_fps),
         'videomama_motion_bucket_id': int(videomama_motion_bucket_id),
         'videomama_noise_aug_strength': float(videomama_noise_aug_strength),
+        'videomama_guide_expand_px': _videomama_guide_expand_px(videomama_guide_expand_px),
         'processing_resolution': str(processing_resolution or DEFAULT_PROCESSING_RESOLUTION),
+        'sam_crop_enabled': bool(sam_crop_enabled),
+        'sam_crop_x': int(sam_crop_x or 0),
+        'sam_crop_y': int(sam_crop_y or 0),
+        'sam_crop_width': int(sam_crop_width or 0),
+        'sam_crop_height': int(sam_crop_height or 0),
         'refine_edges_against_plate': bool(refine_edges_against_plate),
         'free_gpu_after_run': bool(free_gpu_after_run),
         'alpha_output_format': str(alpha_output_format or '16-bit PNG'),
@@ -660,10 +710,15 @@ def _sam_overlay_opacity(value):
     return max(0.0, min(float(value), 1.0))
 
 
+def _videomama_guide_expand_px(value):
+    """Clamp the source-resolution margin used only for VideoMaMa conditioning."""
+    return max(0, min(int(value or 0), 64))
+
+
 def resize_sam_previews(height):
     """Resize all review canvases without re-encoding their current images."""
     height = _sam_preview_height(height)
-    return tuple(gr.update(height=height) for _ in range(4))
+    return tuple(gr.update(height=height) for _ in range(5))
 
 
 def _processing_work_size(processing_resolution):
@@ -679,10 +734,60 @@ def _work_size_from_state(state):
     return WORK_WIDTH, WORK_HEIGHT
 
 
+def _sam_crop_settings(enabled=False, x=0, y=0, width=0, height=0):
+    """Return stable source-pixel crop settings for cache/manifests."""
+    return {
+        'enabled': bool(enabled),
+        'x': int(x or 0),
+        'y': int(y or 0),
+        'width': int(width or 0),
+        'height': int(height or 0),
+    }
+
+
+def _resolve_sam_crop(source_width, source_height, crop_settings=None):
+    """Clamp a requested source ROI to one frame and reject unusably small crops."""
+    source_width = int(source_width)
+    source_height = int(source_height)
+    settings = dict(crop_settings or {})
+    if not settings.get('enabled'):
+        return {
+            'enabled': False,
+            'x': 0,
+            'y': 0,
+            'width': source_width,
+            'height': source_height,
+        }
+    x = max(0, min(int(settings.get('x', 0)), source_width - 1))
+    y = max(0, min(int(settings.get('y', 0)), source_height - 1))
+    requested_width = int(settings.get('width', 0))
+    requested_height = int(settings.get('height', 0))
+    width = source_width - x if requested_width <= 0 else min(requested_width, source_width - x)
+    height = source_height - y if requested_height <= 0 else min(requested_height, source_height - y)
+    if width < 16 or height < 16:
+        raise gr.Error(
+            f"SAM crop is too small after clamping: {width}x{height}. Select a region at least 16x16 pixels."
+        )
+    return {'enabled': True, 'x': x, 'y': y, 'width': width, 'height': height}
+
+
+def _sam_crop_status_suffix(transform):
+    if not transform or not transform.get('crop_enabled'):
+        return ''
+    return (
+        f" from source ROI x={int(transform['crop_x'])}, y={int(transform['crop_y'])}, "
+        f"{int(transform['crop_width'])}x{int(transform['crop_height'])}"
+    )
+
+
 def apply_quality_preset(quality_preset):
     preset = QUALITY_PRESETS.get(str(quality_preset or 'Balanced'), QUALITY_PRESETS['Balanced'])
     if not preset:
         return (
+            gr.update(),
+            gr.update(),
+            gr.update(),
+            gr.update(),
             gr.update(),
             gr.update(),
             gr.update(),
@@ -695,6 +800,10 @@ def apply_quality_preset(quality_preset):
         gr.update(value=preset['videomama_fps']),
         gr.update(value=preset['videomama_motion_bucket_id']),
         gr.update(value=preset['videomama_noise_aug_strength']),
+        gr.update(value=preset['processing_resolution']),
+        gr.update(value=preset['sam_refine_edges_against_plate']),
+        gr.update(value=preset['videomama_guide_expand_px']),
+        gr.update(value=preset['refine_edges_against_plate']),
     )
 
 
@@ -886,6 +995,20 @@ def _resize_mask(mask: np.ndarray, size, resample=Image.Resampling.NEAREST) -> n
     return np.array(Image.fromarray(mask.astype(np.uint8)).resize((width, height), resample))
 
 
+def _expand_videomama_guide(mask: np.ndarray, pixels: int) -> np.ndarray:
+    """Add source-pixel context to the model guide without altering saved SAM masks."""
+    pixels = _videomama_guide_expand_px(pixels)
+    guide = np.asarray(mask, dtype=np.uint8)
+    if pixels == 0 or not np.any(guide):
+        return guide.copy()
+
+    import cv2
+
+    kernel_size = pixels * 2 + 1
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
+    return cv2.dilate(guide, kernel, iterations=1)
+
+
 def _box_mean_2d(image: np.ndarray, radius: int) -> np.ndarray:
     radius = max(1, int(radius))
     padded = np.pad(image.astype(np.float32), ((radius, radius), (radius, radius)), mode='edge')
@@ -941,7 +1064,12 @@ def _refine_alpha_against_plate(plate_rgb: np.ndarray, alpha_rgb: np.ndarray, sa
     return np.clip(refined, 0.0, 1.0).astype(np.float32)
 
 
-def _refine_sam_mask_against_plate(plate_rgb: np.ndarray, sam_mask: np.ndarray) -> np.ndarray:
+def _refine_sam_mask_against_plate(
+    plate_rgb: np.ndarray,
+    sam_mask: np.ndarray,
+    points=None,
+    point_labels=None,
+) -> np.ndarray:
     """Snap a binary SAM boundary to nearby plate colors using constrained GrabCut."""
     import cv2
 
@@ -964,6 +1092,21 @@ def _refine_sam_mask_against_plate(plate_rgb: np.ndarray, sam_mask: np.ndarray) 
     labels[allowed == 0] = cv2.GC_BGD
     labels[binary > 0] = cv2.GC_PR_FGD
     labels[sure_fg > 0] = cv2.GC_FGD
+    prompt_constraints = []
+    prompt_radius = max(2, scale * 2)
+    for point, point_label in zip(points or [], point_labels or []):
+        x, y = (int(round(float(point[0]))), int(round(float(point[1]))))
+        if not (0 <= x < binary.shape[1] and 0 <= y < binary.shape[0]):
+            continue
+        is_positive = int(point_label) > 0
+        prompt_constraints.append((x, y, is_positive))
+        cv2.circle(
+            labels,
+            (x, y),
+            prompt_radius,
+            int(cv2.GC_FGD if is_positive else cv2.GC_BGD),
+            thickness=-1,
+        )
     bg_model = np.zeros((1, 65), dtype=np.float64)
     fg_model = np.zeros((1, 65), dtype=np.float64)
     try:
@@ -971,8 +1114,11 @@ def _refine_sam_mask_against_plate(plate_rgb: np.ndarray, sam_mask: np.ndarray) 
     except cv2.error as exc:
         print(f"Warning: SAM plate-edge refinement fell back to raw mask: {exc}")
         return (binary * 255).astype(np.uint8)
-    refined = np.isin(labels, (cv2.GC_FGD, cv2.GC_PR_FGD)) & (allowed > 0)
-    return (refined.astype(np.uint8) * 255)
+    refined = (np.isin(labels, (cv2.GC_FGD, cv2.GC_PR_FGD)) & (allowed > 0)).astype(np.uint8)
+    # The cleanup pass must never contradict an explicit artist correction.
+    for x, y, is_positive in prompt_constraints:
+        cv2.circle(refined, (x, y), prompt_radius, int(is_positive), thickness=-1)
+    return (refined * 255).astype(np.uint8)
 
 
 def _letterbox_transform(source_width: int, source_height: int, work_size=None):
@@ -995,16 +1141,40 @@ def _letterbox_transform(source_width: int, source_height: int, work_size=None):
     }
 
 
-def _letterbox_rgb_frame(frame: np.ndarray, work_size=None):
-    """Fit a source frame into the fixed SAM/UI work canvas without stretching."""
+def _sam_crop_transform(source_width, source_height, work_size=None, crop_settings=None):
+    """Build the full-source to cropped SAM-canvas mapping without loading pixels."""
+    work_width, work_height = work_size or (WORK_WIDTH, WORK_HEIGHT)
+    crop = _resolve_sam_crop(source_width, source_height, crop_settings)
+    transform = _letterbox_transform(
+        crop['width'], crop['height'], work_size=(work_width, work_height)
+    )
+    transform.update({
+        'source_width': int(source_width),
+        'source_height': int(source_height),
+        'crop_enabled': bool(crop['enabled']),
+        'crop_x': int(crop['x']),
+        'crop_y': int(crop['y']),
+        'crop_width': int(crop['width']),
+        'crop_height': int(crop['height']),
+    })
+    return transform
+
+
+def _letterbox_rgb_frame(frame: np.ndarray, work_size=None, crop_settings=None):
+    """Crop a source frame, then fit that ROI into the SAM/UI canvas."""
     work_width, work_height = work_size or (WORK_WIDTH, WORK_HEIGHT)
     source_height, source_width = frame.shape[:2]
-    transform = _letterbox_transform(source_width, source_height, work_size=(work_width, work_height))
+    transform = _sam_crop_transform(
+        source_width, source_height, work_size=(work_width, work_height), crop_settings=crop_settings
+    )
+    crop_x, crop_y = transform['crop_x'], transform['crop_y']
+    crop_width, crop_height = transform['crop_width'], transform['crop_height']
+    cropped_frame = frame[crop_y:crop_y + crop_height, crop_x:crop_x + crop_width]
     content_width = transform['content_width']
     content_height = transform['content_height']
     pad_x = transform['pad_x']
     pad_y = transform['pad_y']
-    resized = Image.fromarray(frame).resize((content_width, content_height), Image.Resampling.BILINEAR)
+    resized = Image.fromarray(cropped_frame).resize((content_width, content_height), Image.Resampling.BILINEAR)
     canvas = np.zeros((work_height, work_width, 3), dtype=np.uint8)
     canvas[pad_y:pad_y + content_height, pad_x:pad_x + content_width] = np.array(resized)
     return canvas, transform
@@ -1018,9 +1188,17 @@ def _work_mask_to_source(mask: np.ndarray, transform) -> np.ndarray:
     pad_y = int(transform.get('pad_y', 0))
     content_width = int(transform.get('content_width', mask.shape[1]))
     content_height = int(transform.get('content_height', mask.shape[0]))
-    source_size = (int(transform['source_width']), int(transform['source_height']))
     cropped = mask[pad_y:pad_y + content_height, pad_x:pad_x + content_width]
-    return _resize_mask(cropped, source_size)
+    crop_width = int(transform.get('crop_width', transform['source_width']))
+    crop_height = int(transform.get('crop_height', transform['source_height']))
+    crop_mask = _resize_mask(cropped, (crop_width, crop_height))
+    source_width = int(transform['source_width'])
+    source_height = int(transform['source_height'])
+    crop_x = int(transform.get('crop_x', 0))
+    crop_y = int(transform.get('crop_y', 0))
+    source_mask = np.zeros((source_height, source_width), dtype=np.uint8)
+    source_mask[crop_y:crop_y + crop_height, crop_x:crop_x + crop_width] = crop_mask
+    return source_mask
 
 
 def _source_mask_to_work(mask: np.ndarray, transform) -> np.ndarray:
@@ -1033,7 +1211,12 @@ def _source_mask_to_work(mask: np.ndarray, transform) -> np.ndarray:
     pad_y = int(transform.get('pad_y', 0))
     content_width = int(transform.get('content_width', work_width))
     content_height = int(transform.get('content_height', work_height))
-    resized = _resize_mask(mask, (content_width, content_height))
+    crop_x = int(transform.get('crop_x', 0))
+    crop_y = int(transform.get('crop_y', 0))
+    crop_width = int(transform.get('crop_width', mask.shape[1]))
+    crop_height = int(transform.get('crop_height', mask.shape[0]))
+    cropped = mask[crop_y:crop_y + crop_height, crop_x:crop_x + crop_width]
+    resized = _resize_mask(cropped, (content_width, content_height))
     canvas = np.zeros((work_height, work_width), dtype=np.uint8)
     canvas[pad_y:pad_y + content_height, pad_x:pad_x + content_width] = resized
     return canvas
@@ -1069,6 +1252,100 @@ def _discover_sequence_files(sequence_dir: str):
     return frame_paths
 
 
+def _load_crop_selector_pixels(selector_state):
+    return _load_rgb_frame(
+        selector_state['frame_path'],
+        exr_gamma=selector_state['exr_gamma'],
+        exr_exposure=selector_state['exr_exposure'],
+        exr_color_mode=selector_state['exr_color_mode'],
+        ocio_input_colorspace=selector_state['ocio_input_colorspace'],
+        ocio_display=selector_state['ocio_display'],
+        ocio_view=selector_state['ocio_view'],
+    )
+
+
+def load_sam_crop_selector(sequence_dir, exr_gamma, exr_exposure, exr_color_mode,
+                           ocio_input_colorspace, ocio_display, ocio_view, selector_frame=0):
+    """Load one source frame without resizing for artist ROI selection."""
+    frame_paths = _discover_sequence_files(sequence_dir)
+    frame_idx = max(0, min(int(selector_frame or 0), len(frame_paths) - 1))
+    frame_path = frame_paths[frame_idx]
+    selector_state = {
+        'frame_path': str(frame_path),
+        'exr_gamma': float(exr_gamma),
+        'exr_exposure': float(exr_exposure),
+        'exr_color_mode': str(exr_color_mode or 'Gamma / Exposure'),
+        'ocio_input_colorspace': str(ocio_input_colorspace or 'scene_linear'),
+        'ocio_display': str(ocio_display or ''),
+        'ocio_view': str(ocio_view or ''),
+        'points': [],
+        'frame_index': frame_idx,
+    }
+    frame = _load_crop_selector_pixels(selector_state)
+    height, width = frame.shape[:2]
+    return (
+        frame,
+        selector_state,
+        f"Full-resolution crop selector on frame {frame_idx}: {width}x{height}. "
+        "Click two opposite corners of the SAM ROI.",
+    )
+
+
+def select_sam_crop_roi(selector_state, evt: gr.SelectData):
+    """Turn two full-resolution image clicks into a persistent source-pixel ROI."""
+    if not selector_state:
+        raise gr.Error('Load the full-resolution crop selector first.')
+    if evt is None or evt.index is None:
+        raise gr.Error('Crop click data was not received by Gradio.')
+    frame = _load_crop_selector_pixels(selector_state)
+    height, width = frame.shape[:2]
+    x = max(0, min(int(evt.index[0]), width - 1))
+    y = max(0, min(int(evt.index[1]), height - 1))
+    points = list(selector_state.get('points') or [])
+    if len(points) >= 2:
+        points = []
+    points.append([x, y])
+    selector_state = dict(selector_state)
+    selector_state['points'] = points
+
+    annotated = Image.fromarray(frame.copy())
+    draw = ImageDraw.Draw(annotated)
+    stroke = max(3, int(round(min(width, height) / 400)))
+    radius = stroke * 3
+    for point_x, point_y in points:
+        draw.ellipse(
+            (point_x - radius, point_y - radius, point_x + radius, point_y + radius),
+            outline=(255, 215, 0),
+            width=stroke,
+        )
+
+    if len(points) == 1:
+        return (
+            np.array(annotated), selector_state,
+            gr.update(), gr.update(), gr.update(), gr.update(), gr.update(),
+            f"First corner set at ({x}, {y}). Click the opposite corner.",
+        )
+
+    left = min(points[0][0], points[1][0])
+    top = min(points[0][1], points[1][1])
+    crop_width = abs(points[1][0] - points[0][0])
+    crop_height = abs(points[1][1] - points[0][1])
+    if crop_width < 16 or crop_height < 16:
+        selector_state['points'] = []
+        raise gr.Error('Selected crop is too small. Click two corners at least 16 pixels apart.')
+    draw.rectangle(
+        (left, top, left + crop_width, top + crop_height),
+        outline=(0, 255, 120),
+        width=stroke,
+    )
+    return (
+        np.array(annotated), selector_state,
+        True, left, top, crop_width, crop_height,
+        f"SAM source ROI selected: x={left}, y={top}, {crop_width}x{crop_height}. "
+        "Click Load Sequence to rebuild the SAM cache from this crop.",
+    )
+
+
 def _source_fingerprints(frame_paths):
     fingerprints = []
     for path in frame_paths:
@@ -1097,7 +1374,7 @@ def _run_root(base_name: str):
 
 def _write_session_meta(run_root: Path, sequence_dir: str, exr_gamma: float, exr_exposure: float,
                         frame_names, frame_sizes, frame_transforms=None, work_size=None,
-                        source_fingerprints=None, exr_color_settings=None):
+                        source_fingerprints=None, exr_color_settings=None, sam_crop_settings=None):
     """Record which sequence a run belongs to so it can be matched on resume."""
     work_width, work_height = work_size or (WORK_WIDTH, WORK_HEIGHT)
     meta = {
@@ -1111,6 +1388,7 @@ def _write_session_meta(run_root: Path, sequence_dir: str, exr_gamma: float, exr
         'work_size': [int(work_width), int(work_height)],
         'source_fingerprints': source_fingerprints or [],
         'exr_color_settings': exr_color_settings or {},
+        'sam_crop_settings': dict(sam_crop_settings or _sam_crop_settings()),
         'sam_cache_version': SAM_CACHE_VERSION,
     }
     try:
@@ -1121,7 +1399,8 @@ def _write_session_meta(run_root: Path, sequence_dir: str, exr_gamma: float, exr
 
 
 def _find_existing_run(sequence_dir: str, frame_names, work_size=None, exr_gamma=None,
-                       exr_exposure=None, source_fingerprints=None, exr_color_settings=None):
+                       exr_exposure=None, source_fingerprints=None, exr_color_settings=None,
+                       sam_crop_settings=None):
     """Find the most recent prior run for this sequence that has data to restore."""
     if not APP_TMP_ROOT.is_dir():
         return None
@@ -1129,6 +1408,7 @@ def _find_existing_run(sequence_dir: str, frame_names, work_size=None, exr_gamma
     safe = _safe_name(Path(sequence_dir).name)
     frame_count = len(frame_names)
     work_width, work_height = work_size or (WORK_WIDTH, WORK_HEIGHT)
+    expected_crop_settings = dict(sam_crop_settings or _sam_crop_settings())
 
     run_dirs = sorted((d for d in APP_TMP_ROOT.iterdir() if d.is_dir()), key=lambda d: d.name, reverse=True)
     for run_dir in run_dirs:
@@ -1158,10 +1438,16 @@ def _find_existing_run(sequence_dir: str, frame_names, work_size=None, exr_gamma
                             'view': '',
                         }) == dict(exr_color_settings)
                     )
+                    and dict(meta.get('sam_crop_settings') or _sam_crop_settings())
+                        == expected_crop_settings
                 )
             except (json.JSONDecodeError, OSError, ValueError, TypeError):
                 matches = False
-        elif run_dir.name.endswith('_' + safe) and (work_width, work_height) == (WORK_WIDTH, WORK_HEIGHT):
+        elif (
+            run_dir.name.endswith('_' + safe)
+            and (work_width, work_height) == (WORK_WIDTH, WORK_HEIGHT)
+            and not expected_crop_settings.get('enabled')
+        ):
             # Older runs predate session.json; fall back to name + cached frame count.
             cache = run_dir / 'sam3_frames'
             matches = cache.is_dir() and len(list(cache.glob('*.jpg'))) == frame_count
@@ -1266,12 +1552,14 @@ def _prompt_manifest_payload(state, threshold):
     return {
         'status': 'complete',
         'model_version': os.environ.get('SAM3_MODEL_VERSION', 'sam3'),
+        'keyframe_policy_version': SAM_KEYFRAME_POLICY_VERSION,
         'prompt_mode': mode,
         'prompt_hash': _stable_json_hash(prompt_payload),
         'prompt': prompt_payload,
         'output_prob_thresh': float(threshold),
         'refine_edges_against_plate': bool(state.get('sam_refine_edges_against_plate', True)),
         'work_size': list(_work_size_from_state(state)),
+        'sam_crop_settings': dict(state.get('sam_crop_settings') or _sam_crop_settings()),
         'frame_count': len(state['frame_names']),
         'frame_names': list(state['frame_names']),
     }
@@ -1389,7 +1677,11 @@ def _frame_info(state):
     if state is None:
         return "No sequence loaded."
     frame_idx = state['current_frame_idx']
-    return f"Frame {frame_idx + 1} / {len(state['frame_paths'])}: {state['frame_names'][frame_idx]}"
+    transform = (state.get('frame_transforms') or [{}])[frame_idx]
+    return (
+        f"Frame {frame_idx + 1} / {len(state['frame_paths'])}: {state['frame_names'][frame_idx]}"
+        f"{_sam_crop_status_suffix(transform)}"
+    )
 
 
 def _prompt_data_for_frame(state, frame_idx):
@@ -1614,14 +1906,19 @@ def _compute_preview_mask(state, frame_idx, sam_output_prob_thresh=None):
     preview_masks = state.setdefault('preview_masks', {})
     if prompts['points'] and sam3_tracker is not None:
         frame = _load_cached_frame(state, frame_idx)
-        mask = sam3_tracker.get_frame_mask(
-            frame,
+        mask = sam3_tracker.get_frame_mask_from_path(
+            state['cache_frame_paths'][frame_idx],
             prompts['points'],
             prompts['labels'],
             output_prob_thresh=sam_output_prob_thresh,
         )
         if state.get('sam_refine_edges_against_plate', True):
-            mask = _refine_sam_mask_against_plate(frame, mask)
+            mask = _refine_sam_mask_against_plate(
+                frame,
+                mask,
+                points=prompts['points'],
+                point_labels=prompts['labels'],
+            )
         _cache_preview_mask(state, frame_idx, mask)
         return mask
 
@@ -1690,6 +1987,8 @@ def load_sequence(sequence_dir: str, exr_gamma: float, exr_exposure: float = DEF
                   resume_from_tmp: bool = True,
                   prompt_mode: str = 'Point keyframes', concept_prompt: str = '',
                   processing_resolution: str = DEFAULT_PROCESSING_RESOLUTION,
+                  sam_crop_enabled: bool = False, sam_crop_x: int = 0, sam_crop_y: int = 0,
+                  sam_crop_width: int = 0, sam_crop_height: int = 0,
                   exr_color_mode: str = 'Gamma / Exposure',
                   ocio_input_colorspace: str = 'scene_linear', ocio_display: str = '',
                   ocio_view: str = '',
@@ -1711,11 +2010,17 @@ def load_sequence(sequence_dir: str, exr_gamma: float, exr_exposure: float = DEF
     concept_prompt = str(concept_prompt or '').strip()
     work_size = _processing_work_size(processing_resolution)
     work_width, work_height = work_size
+    crop_settings = _sam_crop_settings(
+        sam_crop_enabled, sam_crop_x, sam_crop_y, sam_crop_width, sam_crop_height
+    )
     frame_paths = _discover_sequence_files(sequence_dir)
     source_fingerprints = _source_fingerprints(frame_paths)
     frame_names = [path.name for path in frame_paths]
     frame_sizes = [_image_size(str(path)) for path in frame_paths]
-    frame_transforms = [_letterbox_transform(width, height, work_size=work_size) for width, height in frame_sizes]
+    frame_transforms = [
+        _sam_crop_transform(width, height, work_size=work_size, crop_settings=crop_settings)
+        for width, height in frame_sizes
+    ]
 
     existing_run = _find_existing_run(
         sequence_dir,
@@ -1725,6 +2030,7 @@ def load_sequence(sequence_dir: str, exr_gamma: float, exr_exposure: float = DEF
         exr_exposure=exr_exposure,
         source_fingerprints=source_fingerprints,
         exr_color_settings=exr_color_settings,
+        sam_crop_settings=crop_settings,
     ) if resume_from_tmp else None
     run_root = existing_run if existing_run is not None else _run_root(Path(sequence_dir).name)
     cache_dir = run_root / 'sam3_frames'
@@ -1782,7 +2088,9 @@ def load_sequence(sequence_dir: str, exr_gamma: float, exr_exposure: float = DEF
                 ocio_display=exr_color_settings['display'],
                 ocio_view=exr_color_settings['view'],
             )
-            working_frame, frame_transforms[idx] = _letterbox_rgb_frame(frame, work_size=work_size)
+            working_frame, frame_transforms[idx] = _letterbox_rgb_frame(
+                frame, work_size=work_size, crop_settings=crop_settings
+            )
             cache_path = cache_dir / f"{idx:05d}.jpg"
             # SAM 3's video loader expects JPEG frames. Use maximum quality and
             # disable chroma subsampling so fine colored edges survive caching.
@@ -1793,7 +2101,7 @@ def load_sequence(sequence_dir: str, exr_gamma: float, exr_exposure: float = DEF
     _write_session_meta(
         run_root, sequence_dir, exr_gamma, exr_exposure, frame_names, frame_sizes,
         frame_transforms, work_size=work_size, source_fingerprints=source_fingerprints,
-        exr_color_settings=exr_color_settings,
+        exr_color_settings=exr_color_settings, sam_crop_settings=crop_settings,
     )
 
     state = {
@@ -1820,6 +2128,7 @@ def load_sequence(sequence_dir: str, exr_gamma: float, exr_exposure: float = DEF
         'exr_color_settings': exr_color_settings,
         'work_size': [int(work_width), int(work_height)],
         'processing_resolution': str(processing_resolution or DEFAULT_PROCESSING_RESOLUTION),
+        'sam_crop_settings': crop_settings,
         'sam_output_prob_thresh': _sam_output_prob_thresh(_settings.get('sam_output_prob_thresh', 0.5)),
         'sam_overlay_opacity': _sam_overlay_opacity(_settings.get('sam_overlay_opacity', MASK_ALPHA)),
         'sam_refine_edges_against_plate': bool(_settings.get('sam_refine_edges_against_plate', True)),
@@ -1846,7 +2155,9 @@ def load_sequence(sequence_dir: str, exr_gamma: float, exr_exposure: float = DEF
         sam_metadata_matches = (
             sam_manifest.get('status') == 'complete'
             and sam_manifest.get('model_version') == os.environ.get('SAM3_MODEL_VERSION', 'sam3')
+            and int(sam_manifest.get('keyframe_policy_version', 0)) == SAM_KEYFRAME_POLICY_VERSION
             and list(sam_manifest.get('work_size') or []) == [work_width, work_height]
+            and dict(sam_manifest.get('sam_crop_settings') or _sam_crop_settings()) == crop_settings
             and int(sam_manifest.get('frame_count', -1)) == len(frame_names)
             and bool(sam_manifest.get('refine_edges_against_plate', False))
                 == bool(state.get('sam_refine_edges_against_plate', True))
@@ -1862,25 +2173,39 @@ def load_sequence(sequence_dir: str, exr_gamma: float, exr_exposure: float = DEF
 
         videomama_manifest = manifest.get('videomama') or {}
         outputs_dir = Path(videomama_manifest.get('output_dir') or (run_root / 'videomama_frames'))
-        if _sequence_outputs_complete(outputs_dir, frame_names, frame_sizes):
+        videomama_sam_matches = (
+            sam_metadata_matches
+            and videomama_manifest.get('sam_prompt_hash') == sam_manifest.get('prompt_hash')
+            and int(videomama_manifest.get('sam_keyframe_policy_version', 0))
+                == SAM_KEYFRAME_POLICY_VERSION
+        )
+        if videomama_sam_matches and _sequence_outputs_complete(outputs_dir, frame_names, frame_sizes):
             state['videomama_output_dir'] = str(outputs_dir)
             restored.append('VideoMaMa outputs')
-        elif outputs_dir.exists():
+        elif videomama_sam_matches and outputs_dir.exists():
             print(f"Found a partial VideoMaMa output set in {outputs_dir}; keeping it for range resume.")
             state['videomama_output_dir'] = str(outputs_dir)
+        elif outputs_dir.exists():
+            print(f"Ignoring stale VideoMaMa outputs created from an older SAM 3 mask set in {outputs_dir}")
         alpha_dir = Path(videomama_manifest.get('alpha_dir') or (run_root / 'alpha_frames'))
-        if alpha_dir.is_dir() and (any(alpha_dir.glob('*.png')) or any(alpha_dir.glob('*.exr'))):
+        if (
+            videomama_sam_matches
+            and alpha_dir.is_dir()
+            and (any(alpha_dir.glob('*.png')) or any(alpha_dir.glob('*.exr')))
+        ):
             state['alpha_output_dir'] = str(alpha_dir)
 
     if restored:
         status_message = (
             f"Loaded {len(frame_paths)} frames from {sequence_dir}. "
-            f"Resumed from {run_root.name} at {work_width}x{work_height}: restored {', '.join(restored)}."
+            f"Resumed from {run_root.name} at {work_width}x{work_height}"
+            f"{_sam_crop_status_suffix(frame_transforms[0])}: restored {', '.join(restored)}."
         )
     else:
         status_message = (
             f"Loaded {len(frame_paths)} frames from {sequence_dir}. "
-            f"Working at {work_width}x{work_height}. Add point keyframes or enter a text concept, then generate SAM 3 masks."
+            f"Working at {work_width}x{work_height}{_sam_crop_status_suffix(frame_transforms[0])}. "
+            "Add point keyframes or enter a text concept, then generate SAM 3 masks."
         )
 
     preview, mask, output_preview = _render_frame_preview(state, 0)
@@ -1905,6 +2230,8 @@ def load_sequence(sequence_dir: str, exr_gamma: float, exr_exposure: float = DEF
 def clear_sequence_cache_and_reload(state, sequence_dir: str, exr_gamma: float, exr_exposure: float,
                                     prompt_mode: str, concept_prompt: str,
                                     processing_resolution: str = DEFAULT_PROCESSING_RESOLUTION,
+                                    sam_crop_enabled: bool = False, sam_crop_x: int = 0, sam_crop_y: int = 0,
+                                    sam_crop_width: int = 0, sam_crop_height: int = 0,
                                     exr_color_mode: str = 'Gamma / Exposure',
                                     ocio_input_colorspace: str = 'scene_linear', ocio_display: str = '',
                                     ocio_view: str = ''):
@@ -1931,6 +2258,9 @@ def clear_sequence_cache_and_reload(state, sequence_dir: str, exr_gamma: float, 
                     'display': str(ocio_display or ''),
                     'view': str(ocio_view or ''),
                 },
+                sam_crop_settings=_sam_crop_settings(
+                    sam_crop_enabled, sam_crop_x, sam_crop_y, sam_crop_width, sam_crop_height
+                ),
             )
             if existing_run is not None:
                 candidate_roots.append(existing_run)
@@ -1954,6 +2284,9 @@ def clear_sequence_cache_and_reload(state, sequence_dir: str, exr_gamma: float, 
     payload = list(load_sequence(sequence_dir, exr_gamma, exr_exposure, resume_from_tmp=False,
                                  prompt_mode=prompt_mode, concept_prompt=concept_prompt,
                                  processing_resolution=processing_resolution,
+                                 sam_crop_enabled=sam_crop_enabled, sam_crop_x=sam_crop_x,
+                                 sam_crop_y=sam_crop_y, sam_crop_width=sam_crop_width,
+                                 sam_crop_height=sam_crop_height,
                                  exr_color_mode=exr_color_mode,
                                  ocio_input_colorspace=ocio_input_colorspace,
                                  ocio_display=ocio_display, ocio_view=ocio_view))
@@ -2217,14 +2550,32 @@ def _ensure_loaded_processing_resolution(state, processing_resolution):
         )
 
 
+def _ensure_loaded_sam_crop(state, enabled=None, x=0, y=0, width=0, height=0):
+    if enabled is None:
+        return
+    selected = _sam_crop_settings(enabled, x, y, width, height)
+    loaded = dict(state.get('sam_crop_settings') or _sam_crop_settings())
+    if selected != loaded:
+        raise gr.Error(
+            "The selected SAM Source ROI Crop does not match the loaded sequence cache. "
+            "Click Load Sequence to apply the crop before generating masks."
+        )
+
+
 @_serialized_gpu_job
 def generate_sam3_masks(state, prompt_mode=None, concept_prompt=None, sam_output_prob_thresh=0.5,
-                        processing_resolution=None, sam_refine_edges_against_plate=True,
+                        processing_resolution=None,
+                        sam_crop_enabled=None, sam_crop_x=0, sam_crop_y=0,
+                        sam_crop_width=0, sam_crop_height=0,
+                        sam_refine_edges_against_plate=True,
                         progress=gr.Progress()):
     if state is None:
         raise gr.Error('Load a sequence first.')
 
     _ensure_loaded_processing_resolution(state, processing_resolution)
+    _ensure_loaded_sam_crop(
+        state, sam_crop_enabled, sam_crop_x, sam_crop_y, sam_crop_width, sam_crop_height
+    )
     sam_output_prob_thresh = _sam_output_prob_thresh(sam_output_prob_thresh)
     state['sam_output_prob_thresh'] = sam_output_prob_thresh
     state['sam_refine_edges_against_plate'] = bool(sam_refine_edges_against_plate)
@@ -2239,6 +2590,12 @@ def generate_sam3_masks(state, prompt_mode=None, concept_prompt=None, sam_output
     if concept_prompt is not None and (str(concept_prompt or '').strip() or not state.get('concept_prompt')):
         state['concept_prompt'] = str(concept_prompt or '').strip()
 
+    point_prompts = (
+        _normalized_prompt_dict(state)
+        if state.get('prompt_mode') != 'Text concept'
+        else {}
+    )
+
     run_root = Path(state['run_root'])
     mask_dir = run_root / 'sam3_masks'
     staging_dir = run_root / f".sam3_masks.staging.{uuid.uuid4().hex}"
@@ -2252,7 +2609,13 @@ def generate_sam3_masks(state, prompt_mode=None, concept_prompt=None, sam_output
         if frame_idx < 0 or frame_idx >= len(state['frame_names']):
             raise ValueError(f"SAM 3 returned out-of-range frame index {frame_idx}.")
         if state.get('sam_refine_edges_against_plate', True):
-            work_mask = _refine_sam_mask_against_plate(_load_cached_frame(state, frame_idx), work_mask)
+            prompt_data = point_prompts.get(int(frame_idx), {})
+            work_mask = _refine_sam_mask_against_plate(
+                _load_cached_frame(state, frame_idx),
+                work_mask,
+                points=prompt_data.get('points'),
+                point_labels=prompt_data.get('labels'),
+            )
         transform = (state.get('frame_transforms') or [{}])[frame_idx]
         source_mask = _work_mask_to_source(work_mask, transform)
         path = staging_dir / f"{Path(state['frame_names'][frame_idx]).stem}.png"
@@ -2285,7 +2648,7 @@ def generate_sam3_masks(state, prompt_mode=None, concept_prompt=None, sam_output
             except ValueError as exc:
                 raise gr.Error(str(exc)) from exc
         else:
-            prompts = _normalized_prompt_dict(state)
+            prompts = point_prompts
             _write_json_atomic(run_root / 'keyframe_prompts.json', {str(k): v for k, v in prompts.items()})
             tracker.track_video_from_dir(
                 state['cache_dir'],
@@ -2325,7 +2688,8 @@ def generate_sam3_masks(state, prompt_mode=None, concept_prompt=None, sam_output
         state,
         f"Generated {len(state['frame_names'])} SAM 3 masks at source resolution using {_keyframe_summary(state)} "
         f"(SAM threshold {sam_output_prob_thresh:.3f}, plate-edge refinement "
-        f"{state.get('sam_refine_edges_against_plate', True)})",
+        f"{state.get('sam_refine_edges_against_plate', True)}, "
+        f"crop {state.get('sam_crop_settings') or _sam_crop_settings()})",
     )
 
 
@@ -2348,11 +2712,18 @@ def run_sequence(state, chunk_size, overlap, range_start=0, range_end=-1, custom
                  prompt_mode=None, concept_prompt=None, sam_output_prob_thresh=0.5,
                  videomama_mask_cond_mode='vae', videomama_seed=42, videomama_fps=7,
                  videomama_motion_bucket_id=127, videomama_noise_aug_strength=0.0,
-                 processing_resolution=None, refine_edges_against_plate=False,
+                 videomama_guide_expand_px=0,
+                 processing_resolution=None,
+                 sam_crop_enabled=None, sam_crop_x=0, sam_crop_y=0,
+                 sam_crop_width=0, sam_crop_height=0,
+                 refine_edges_against_plate=False,
                  free_gpu_after_run=False, alpha_output_format='16-bit PNG', progress=gr.Progress()):
     if state is None:
         raise gr.Error('Load a sequence first.')
     _ensure_loaded_processing_resolution(state, processing_resolution)
+    _ensure_loaded_sam_crop(
+        state, sam_crop_enabled, sam_crop_x, sam_crop_y, sam_crop_width, sam_crop_height
+    )
     if prompt_mode is not None:
         state['prompt_mode'] = str(prompt_mode or 'Point keyframes')
     if concept_prompt is not None and (str(concept_prompt or '').strip() or not state.get('concept_prompt')):
@@ -2367,6 +2738,7 @@ def run_sequence(state, chunk_size, overlap, range_start=0, range_end=-1, custom
     videomama_fps = max(1, int(videomama_fps))
     videomama_motion_bucket_id = max(0, min(int(videomama_motion_bucket_id), 255))
     videomama_noise_aug_strength = max(0.0, min(float(videomama_noise_aug_strength), 1.0))
+    videomama_guide_expand_px = _videomama_guide_expand_px(videomama_guide_expand_px)
     refine_edges_against_plate = bool(refine_edges_against_plate)
     free_gpu_after_run = bool(free_gpu_after_run)
     alpha_output_format = str(alpha_output_format or '16-bit PNG')
@@ -2384,8 +2756,12 @@ def run_sequence(state, chunk_size, overlap, range_start=0, range_end=-1, custom
         or generated_mask_thresh is None
         or abs(float(generated_mask_thresh) - sam_output_prob_thresh) > 1e-6
         or saved_sam_manifest.get('model_version') != expected_sam_manifest.get('model_version')
+        or saved_sam_manifest.get('keyframe_policy_version')
+            != expected_sam_manifest.get('keyframe_policy_version')
         or saved_sam_manifest.get('prompt_hash') != expected_sam_manifest.get('prompt_hash')
         or list(saved_sam_manifest.get('work_size') or []) != list(expected_sam_manifest.get('work_size') or [])
+        or dict(saved_sam_manifest.get('sam_crop_settings') or _sam_crop_settings())
+            != dict(expected_sam_manifest.get('sam_crop_settings') or _sam_crop_settings())
         or bool(saved_sam_manifest.get('refine_edges_against_plate', False))
             != bool(expected_sam_manifest.get('refine_edges_against_plate', True))
     )
@@ -2397,6 +2773,7 @@ def run_sequence(state, chunk_size, overlap, range_start=0, range_end=-1, custom
             sam_output_prob_thresh=sam_output_prob_thresh,
             sam_refine_edges_against_plate=state.get('sam_refine_edges_against_plate', True),
         )[4]
+        saved_sam_manifest = (_read_run_manifest(Path(state['run_root'])).get('sam3') or {})
 
     import torch
 
@@ -2427,7 +2804,7 @@ def run_sequence(state, chunk_size, overlap, range_start=0, range_end=-1, custom
     written_indices = []
     pending_overlap = {}
     previous_videomama_manifest = (_read_run_manifest(run_root).get('videomama') or {})
-    prior_frame_records = {
+    candidate_prior_frame_records = {
         str(index): record
         for index, record in (previous_videomama_manifest.get('frame_records') or {}).items()
         if str(index).isdigit()
@@ -2446,7 +2823,12 @@ def run_sequence(state, chunk_size, overlap, range_start=0, range_end=-1, custom
         'fps': videomama_fps,
         'motion_bucket_id': videomama_motion_bucket_id,
         'noise_aug_strength': videomama_noise_aug_strength,
+        'guide_expand_px': videomama_guide_expand_px,
         'processing_size': list(work_size),
+        'sam_prompt_hash': saved_sam_manifest.get('prompt_hash'),
+        'sam_keyframe_policy_version': saved_sam_manifest.get('keyframe_policy_version'),
+        'sam_crop_settings': dict(state.get('sam_crop_settings') or _sam_crop_settings()),
+        'process_on_source_roi': bool((state.get('sam_crop_settings') or {}).get('enabled')),
         'refine_edges_against_plate': refine_edges_against_plate,
         'alpha_output_format': alpha_output_format,
         'base_model_path': os.environ.get('VIDEOMAMA_BASE_MODEL_PATH', ''),
@@ -2457,6 +2839,11 @@ def run_sequence(state, chunk_size, overlap, range_start=0, range_end=-1, custom
     settings_hash = _stable_json_hash({
         key: value for key, value in run_manifest.items() if key not in {'status', 'range'}
     })
+    prior_frame_records = {
+        index: record
+        for index, record in candidate_prior_frame_records.items()
+        if record.get('settings_hash') == settings_hash
+    }
     run_manifest['settings_hash'] = settings_hash
     run_manifest['frame_records'] = prior_frame_records
     _update_run_manifest(run_root, 'videomama', run_manifest)
@@ -2465,7 +2852,8 @@ def run_sequence(state, chunk_size, overlap, range_start=0, range_end=-1, custom
         f"({range_end - range_start + 1} of {total_frames}) with chunk_size={chunk_size}, overlap={overlap}, "
         f"mask_cond_mode={videomama_mask_cond_mode}, seed={videomama_seed}, fps={videomama_fps}, "
         f"motion_bucket_id={videomama_motion_bucket_id}, noise_aug_strength={videomama_noise_aug_strength:.4f}, "
-        f"processing_size={work_size[0]}x{work_size[1]}, refine_edges={refine_edges_against_plate}"
+        f"guide_expand_px={videomama_guide_expand_px}, processing_size={work_size[0]}x{work_size[1]}, "
+        f"refine_edges={refine_edges_against_plate}"
     )
     try:
         # `end` is exclusive within the loop; the range is inclusive of range_end.
@@ -2480,7 +2868,7 @@ def run_sequence(state, chunk_size, overlap, range_start=0, range_end=-1, custom
             chunk_frame_names = state['frame_names'][start:end]
             frame_indices = list(range(start, end))
 
-            frames_np = [
+            source_frames_np = [
                 _load_rgb_frame(
                     frame_path,
                     exr_gamma=state['exr_gamma'],
@@ -2494,17 +2882,48 @@ def run_sequence(state, chunk_size, overlap, range_start=0, range_end=-1, custom
                 )
                 for frame_path in chunk_frame_paths
             ]
-            masks_np = []
+            source_masks_np = []
             for frame_name in chunk_frame_names:
                 mask_path = Path(state['generated_masks_dir']) / f"{Path(frame_name).stem}.png"
                 if not mask_path.exists():
                     raise gr.Error(f"Missing SAM 3 mask for {frame_name}: {mask_path}")
-                masks_np.append(np.array(Image.open(mask_path).convert('L')))
+                source_masks_np.append(np.array(Image.open(mask_path).convert('L')))
+
+            # If SAM was given a source ROI, give VideoMaMa the same crop. This
+            # preserves far more subject detail than shrinking the entire 4K
+            # frame to the model canvas, while final alpha is still full-frame.
+            model_frames_np = []
+            model_masks_np = []
+            model_refinement_masks_np = []
+            crop_transforms = []
+            for local_idx, (source_frame, source_mask) in enumerate(
+                zip(source_frames_np, source_masks_np)
+            ):
+                transform = (state.get('frame_transforms') or [{}])[start + local_idx]
+                crop_transforms.append(transform)
+                if transform.get('crop_enabled'):
+                    crop_x = int(transform['crop_x'])
+                    crop_y = int(transform['crop_y'])
+                    crop_width = int(transform['crop_width'])
+                    crop_height = int(transform['crop_height'])
+                    model_frames_np.append(
+                        source_frame[crop_y:crop_y + crop_height, crop_x:crop_x + crop_width]
+                    )
+                    refinement_mask = source_mask[
+                        crop_y:crop_y + crop_height, crop_x:crop_x + crop_width
+                    ]
+                else:
+                    model_frames_np.append(source_frame)
+                    refinement_mask = source_mask
+                model_refinement_masks_np.append(refinement_mask)
+                model_masks_np.append(
+                    _expand_videomama_guide(refinement_mask, videomama_guide_expand_px)
+                )
 
             output_frames = videomama(
                 pipeline,
-                frames_np,
-                masks_np,
+                model_frames_np,
+                model_masks_np,
                 seed=videomama_seed,
                 mask_cond_mode=videomama_mask_cond_mode,
                 fps=videomama_fps,
@@ -2523,14 +2942,28 @@ def run_sequence(state, chunk_size, overlap, range_start=0, range_end=-1, custom
                 alpha = np.asarray(output_frame, dtype=np.float32)
                 if alpha.ndim == 3:
                     alpha = alpha.mean(axis=2)
-                source_size = tuple(state['frame_sizes'][start + local_idx])
-                if alpha.shape != (source_size[1], source_size[0]):
+                model_height, model_width = model_frames_np[local_idx].shape[:2]
+                if alpha.shape != (model_height, model_width):
                     alpha = np.array(
-                        Image.fromarray(alpha, mode='F').resize(source_size, Image.Resampling.BILINEAR),
+                        Image.fromarray(alpha, mode='F').resize(
+                            (model_width, model_height), Image.Resampling.BICUBIC
+                        ),
                         dtype=np.float32,
                     )
                 if refine_edges_against_plate:
-                    alpha = _refine_alpha_against_plate(frames_np[local_idx], alpha, masks_np[local_idx])
+                    alpha = _refine_alpha_against_plate(
+                        model_frames_np[local_idx], alpha, model_refinement_masks_np[local_idx]
+                    )
+                transform = crop_transforms[local_idx]
+                if transform.get('crop_enabled'):
+                    source_height, source_width = source_frames_np[local_idx].shape[:2]
+                    full_alpha = np.zeros((source_height, source_width), dtype=np.float32)
+                    crop_x = int(transform['crop_x'])
+                    crop_y = int(transform['crop_y'])
+                    crop_width = int(transform['crop_width'])
+                    crop_height = int(transform['crop_height'])
+                    full_alpha[crop_y:crop_y + crop_height, crop_x:crop_x + crop_width] = alpha
+                    alpha = full_alpha
                 chunk_alphas.append(np.clip(alpha, 0.0, 1.0).astype(np.float32))
 
             leading_indices = [idx for idx in frame_indices if idx in pending_overlap]
@@ -2635,7 +3068,8 @@ def run_sequence(state, chunk_size, overlap, range_start=0, range_end=-1, custom
         f"Saved VideoMaMa outputs for {scope} ({processed} frame(s) written) to {output_dir}. "
         f"VideoMaMa: {videomama_mask_cond_mode}, seed {videomama_seed}, fps {videomama_fps}, "
         f"motion bucket {videomama_motion_bucket_id}, noise {videomama_noise_aug_strength:.4f}, "
-        f"processing {work_size[0]}x{work_size[1]}, edge refine {refine_edges_against_plate}, "
+        f"guide margin {videomama_guide_expand_px}px, processing {work_size[0]}x{work_size[1]}, "
+        f"edge refine {refine_edges_against_plate}, "
         f"alpha {alpha_output_format}, overlap cross-fade {overlap}, free GPU after run {free_gpu_after_run}.",
     )
 
@@ -2644,6 +3078,7 @@ with gr.Blocks(title='VideoMaMa Production Sequence App', css=APP_CSS, js=APP_JS
     gr.Markdown('# VideoMaMa Production Sequence App')
 
     state = gr.State(None)
+    crop_selector_state = gr.State(None)
 
     _settings = _load_ui_settings()
 
@@ -2677,6 +3112,26 @@ with gr.Blocks(title='VideoMaMa Production Sequence App', css=APP_CSS, js=APP_JS
                     clear_cache_reload_btn = gr.Button('Clear Sequence Cache + Reload')
                     delete_tmp_btn = gr.Button('Delete Tmp Data', elem_classes=['danger-button'])
 
+                with gr.Accordion('SAM Source ROI Crop (higher detail)', open=False):
+                    sam_crop_enabled = gr.Checkbox(
+                        label='Enable Source ROI Crop',
+                        value=_settings['sam_crop_enabled'],
+                        info='A fixed ROI is cropped from every original frame before scaling to the SAM canvas.',
+                    )
+                    with gr.Row():
+                        sam_crop_x = gr.Number(label='Crop X', value=_settings['sam_crop_x'], precision=0)
+                        sam_crop_y = gr.Number(label='Crop Y', value=_settings['sam_crop_y'], precision=0)
+                    with gr.Row():
+                        sam_crop_width = gr.Number(
+                            label='Crop Width', value=_settings['sam_crop_width'], precision=0
+                        )
+                        sam_crop_height = gr.Number(
+                            label='Crop Height', value=_settings['sam_crop_height'], precision=0
+                        )
+                    gr.Markdown(
+                        'Use the **SAM Crop** tab to load a full-resolution frame and select the ROI visually.'
+                    )
+
             with gr.Group():
                 prompt_mode = gr.Radio(
                     ['Point keyframes', 'Text concept'],
@@ -2697,9 +3152,17 @@ with gr.Blocks(title='VideoMaMa Production Sequence App', css=APP_CSS, js=APP_JS
 
             with gr.Group():
                 quality_preset = gr.Radio(
-                    ['Balanced', 'Fine Detail', 'Tight Matte', 'Custom'],
+                    ['Balanced', 'Fine Detail', 'Hair Detail', 'Tight Matte', 'Maximum Detail', 'Custom'],
                     value=_settings['quality_preset'],
-                    label='Quality Preset',
+                    label='Combined SAM 3 + VideoMaMa Quality Preset',
+                    info=(
+                        'Hair Detail preserves SAM flyaways, runs at 2048x1152, and gives VideoMaMa '
+                        'a small context margin. Reload the sequence after changing preset resolution.'
+                    ),
+                )
+                gr.Markdown(
+                    '**Hair workflow:** SAM supplies a binary guide; VideoMaMa creates the soft alpha. '
+                    'Hair Detail keeps SAM’s irregular boundary instead of smoothing it away.'
                 )
                 sam_output_prob_thresh = gr.Slider(
                     label='SAM Mask Threshold',
@@ -2709,9 +3172,9 @@ with gr.Blocks(title='VideoMaMa Production Sequence App', css=APP_CSS, js=APP_JS
                     step=0.01,
                 )
                 sam_refine_edges_against_plate = gr.Checkbox(
-                    label='Refine SAM Edges Against Plate',
+                    label='Smooth/Snap SAM Boundary (avoid for hair)',
                     value=_settings['sam_refine_edges_against_plate'],
-                    info='Constrained GrabCut snaps SAM boundaries to nearby plate colors.',
+                    info='Constrained GrabCut can remove thin hair and flyaways. Hair Detail disables it.',
                 )
                 videomama_mask_cond_mode = gr.Radio(
                     ['vae', 'interpolate'],
@@ -2723,9 +3186,21 @@ with gr.Blocks(title='VideoMaMa Production Sequence App', css=APP_CSS, js=APP_JS
                     value=_settings['processing_resolution'],
                     label='Processing Resolution',
                 )
+                videomama_guide_expand_px = gr.Slider(
+                    label='VideoMaMa Hair Guide Margin (source px)',
+                    minimum=0,
+                    maximum=32,
+                    value=_settings['videomama_guide_expand_px'],
+                    step=1,
+                    info=(
+                        'Expands only VideoMaMa’s conditioning guide to include nearby wisps; '
+                        'saved SAM masks stay unchanged.'
+                    ),
+                )
                 refine_edges_against_plate = gr.Checkbox(
-                    label='Refine Edges Against Plate',
+                    label='Smooth Final Alpha Against Plate (avoid for hair)',
                     value=_settings['refine_edges_against_plate'],
+                    info='The guided smoothing pass can simplify fine hair. Hair Detail disables it.',
                 )
                 free_gpu_after_run = gr.Checkbox(
                     label='Free GPU After Run',
@@ -2818,6 +3293,38 @@ with gr.Blocks(title='VideoMaMa Production Sequence App', css=APP_CSS, js=APP_JS
                         show_fullscreen_button=True,
                         elem_classes=['accurate-preview', 'sam-inspector'],
                     )
+                with gr.Tab('SAM Crop'):
+                    gr.Markdown(
+                        '**Crop workflow:** choose a frame, load it, click two opposite corners, '
+                        'then apply the crop. The same ROI is used for every frame; final masks remain full-frame.'
+                    )
+                    with gr.Row():
+                        sam_crop_selector_frame = gr.Number(
+                            label='Selector Frame Index', value=0, precision=0,
+                            info='Choose a frame where the subject is easy to frame.',
+                        )
+                        crop_selector_btn = gr.Button(
+                            '1. Load Full-Resolution Frame', variant='primary'
+                        )
+                    crop_selector_info = gr.Textbox(
+                        label='Crop Selection Status',
+                        value='Click “Load Full-Resolution Frame” to display the image.',
+                        interactive=False,
+                    )
+                    crop_preview = gr.Image(
+                        label='Full-Resolution SAM Crop Selector (click two opposite corners)',
+                        type='numpy',
+                        interactive=False,
+                        sources=[],
+                        format='png',
+                        height=_settings['sam_preview_height'],
+                        show_download_button=False,
+                        show_fullscreen_button=True,
+                        elem_classes=['accurate-preview', 'sam-inspector'],
+                    )
+                    apply_crop_btn = gr.Button(
+                        '2. Apply Selected Crop + Load Sequence', variant='primary'
+                    )
                 with gr.Tab('Mask'):
                     mask_img = gr.Image(
                         label='Current SAM 3 Mask (source resolution after generation)',
@@ -2875,7 +3382,8 @@ with gr.Blocks(title='VideoMaMa Production Sequence App', css=APP_CSS, js=APP_JS
         sam_refine_edges_against_plate,
         videomama_mask_cond_mode,
         videomama_seed, videomama_fps, videomama_motion_bucket_id,
-        videomama_noise_aug_strength, processing_resolution,
+        videomama_noise_aug_strength, videomama_guide_expand_px, processing_resolution,
+        sam_crop_enabled, sam_crop_x, sam_crop_y, sam_crop_width, sam_crop_height,
         refine_edges_against_plate, free_gpu_after_run, alpha_output_format, chunk_size, overlap,
         custom_output_dir, resume_from_tmp, range_start, range_end,
     ]
@@ -2891,6 +3399,10 @@ with gr.Blocks(title='VideoMaMa Production Sequence App', css=APP_CSS, js=APP_JS
             videomama_fps,
             videomama_motion_bucket_id,
             videomama_noise_aug_strength,
+            processing_resolution,
+            sam_refine_edges_against_plate,
+            videomama_guide_expand_px,
+            refine_edges_against_plate,
         ],
     )
 
@@ -2898,11 +3410,40 @@ with gr.Blocks(title='VideoMaMa Production Sequence App', css=APP_CSS, js=APP_JS
     refresh_debug_btn.click(refresh_debug_console, outputs=debug_console)
     clear_debug_btn.click(clear_debug_console, outputs=debug_console)
     unload_models_btn.click(unload_models_for_gpu, outputs=[status, debug_console])
+    crop_selector_btn.click(
+        load_sam_crop_selector,
+        inputs=[
+            sequence_dir, exr_gamma, exr_exposure, exr_color_mode,
+            ocio_input_colorspace, ocio_display, ocio_view, sam_crop_selector_frame,
+        ],
+        outputs=[crop_preview, crop_selector_state, crop_selector_info],
+    )
+    crop_preview.select(
+        select_sam_crop_roi,
+        inputs=crop_selector_state,
+        outputs=[
+            crop_preview, crop_selector_state,
+            sam_crop_enabled, sam_crop_x, sam_crop_y, sam_crop_width, sam_crop_height,
+            crop_selector_info,
+        ],
+    )
     load_btn.click(
         load_sequence,
         inputs=[
             sequence_dir, exr_gamma, exr_exposure, resume_from_tmp, prompt_mode, concept_prompt,
-            processing_resolution, exr_color_mode, ocio_input_colorspace, ocio_display, ocio_view,
+            processing_resolution,
+            sam_crop_enabled, sam_crop_x, sam_crop_y, sam_crop_width, sam_crop_height,
+            exr_color_mode, ocio_input_colorspace, ocio_display, ocio_view,
+        ],
+        outputs=ui_outputs,
+    )
+    apply_crop_btn.click(
+        load_sequence,
+        inputs=[
+            sequence_dir, exr_gamma, exr_exposure, resume_from_tmp, prompt_mode, concept_prompt,
+            processing_resolution,
+            sam_crop_enabled, sam_crop_x, sam_crop_y, sam_crop_width, sam_crop_height,
+            exr_color_mode, ocio_input_colorspace, ocio_display, ocio_view,
         ],
         outputs=ui_outputs,
     )
@@ -2910,7 +3451,9 @@ with gr.Blocks(title='VideoMaMa Production Sequence App', css=APP_CSS, js=APP_JS
         clear_sequence_cache_and_reload,
         inputs=[
             state, sequence_dir, exr_gamma, exr_exposure, prompt_mode, concept_prompt,
-            processing_resolution, exr_color_mode, ocio_input_colorspace, ocio_display, ocio_view,
+            processing_resolution,
+            sam_crop_enabled, sam_crop_x, sam_crop_y, sam_crop_width, sam_crop_height,
+            exr_color_mode, ocio_input_colorspace, ocio_display, ocio_view,
         ],
         outputs=ui_outputs,
     )
@@ -2990,7 +3533,7 @@ with gr.Blocks(title='VideoMaMa Production Sequence App', css=APP_CSS, js=APP_JS
     sam_preview_height.release(
         resize_sam_previews,
         inputs=sam_preview_height,
-        outputs=[preview, preview_large, mask_img, output_img],
+        outputs=[crop_preview, preview, preview_large, mask_img, output_img],
         queue=False,
     )
     sam_overlay_opacity.release(
@@ -3007,7 +3550,9 @@ with gr.Blocks(title='VideoMaMa Production Sequence App', css=APP_CSS, js=APP_JS
         generate_sam3_masks,
         inputs=[
             state, prompt_mode, concept_prompt, sam_output_prob_thresh,
-            processing_resolution, sam_refine_edges_against_plate,
+            processing_resolution,
+            sam_crop_enabled, sam_crop_x, sam_crop_y, sam_crop_width, sam_crop_height,
+            sam_refine_edges_against_plate,
         ],
         outputs=ui_outputs,
     )
@@ -3018,7 +3563,10 @@ with gr.Blocks(title='VideoMaMa Production Sequence App', css=APP_CSS, js=APP_JS
             prompt_mode, concept_prompt, sam_output_prob_thresh,
             videomama_mask_cond_mode, videomama_seed, videomama_fps,
             videomama_motion_bucket_id, videomama_noise_aug_strength,
-            processing_resolution, refine_edges_against_plate, free_gpu_after_run,
+            videomama_guide_expand_px,
+            processing_resolution,
+            sam_crop_enabled, sam_crop_x, sam_crop_y, sam_crop_width, sam_crop_height,
+            refine_edges_against_plate, free_gpu_after_run,
             alpha_output_format,
         ],
         outputs=ui_outputs,

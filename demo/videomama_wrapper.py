@@ -66,7 +66,9 @@ def videomama(
     target_width, target_height = int(target_size[0]), int(target_size[1])
     frames_resized = [f.resize((target_width, target_height), Image.Resampling.BILINEAR)
                       for f in frames_pil]
-    masks_resized = [m.resize((target_width, target_height), Image.Resampling.BILINEAR)
+    # Masks are categorical guidance. Bilinear resizing invents a wide gray
+    # transition before the VAE sees the mask and produces visibly soft mattes.
+    masks_resized = [m.resize((target_width, target_height), Image.Resampling.NEAREST)
                      for m in mask_frames_pil]
 
     model_padding = _model_padding((target_width, target_height))
@@ -124,7 +126,7 @@ def videomama(
             out = out[top:top + target_height, left:left + target_width]
         resized_channels = [
             np.array(
-                Image.fromarray(out[:, :, channel], mode='F').resize(src.size, Image.Resampling.BILINEAR),
+                Image.fromarray(out[:, :, channel], mode='F').resize(src.size, Image.Resampling.BICUBIC),
                 dtype=np.float32,
             )
             for channel in range(out.shape[2])

@@ -307,7 +307,7 @@ class SAM3VideoTracker:
 
         session_id = self._start_session(frames_dir)
         try:
-            latest_outputs = {}
+            keyframe_masks = {}
             for frame_idx, prompt_data in prompts_by_frame.items():
                 response = self._add_prompt(
                     session_id,
@@ -318,7 +318,13 @@ class SAM3VideoTracker:
                     obj_id=obj_id,
                     output_prob_thresh=output_prob_thresh,
                 )
-                latest_outputs[frame_idx] = response.get("outputs", {})
+                # SAM 3 reuses internal output buffers as later corrections are
+                # added. Convert and copy immediately; retaining the response's
+                # tensors until the loop ends lets later keyframes mutate an
+                # earlier artist-approved result.
+                keyframe_masks[frame_idx] = self._extract_mask(
+                    response.get("outputs", {}), (height, width), obj_id=obj_id
+                ).copy()
 
             final_masks = [
                 np.zeros((height, width), dtype=np.uint8) if collect_masks else None
@@ -333,8 +339,14 @@ class SAM3VideoTracker:
                 if mask_callback is not None:
                     mask_callback(int(frame_idx), mask)
 
-            for frame_idx, outputs in latest_outputs.items():
-                record_mask(frame_idx, self._extract_mask(outputs, (height, width), obj_id=obj_id))
+            # ``add_prompt`` is the authoritative result on an artist-authored
+            # keyframe. Keep those masks separate because the propagation stream
+            # also emits conditioning frames and can return a different tracked
+            # result for them after later corrections have been added.
+            for frame_idx, mask in keyframe_masks.items():
+                record_mask(frame_idx, mask)
+
+            propagated_keyframe_drift = {}
 
             # SAM 3's add_prompt path runs the model under a bf16 autocast context,
             # but the library's propagate_in_video (sam3_base_predictor) does not wrap
@@ -364,18 +376,36 @@ class SAM3VideoTracker:
                     }
                 ):
                     frame_idx = int(response["frame_index"])
-                    record_mask(
-                        frame_idx,
-                        self._extract_mask(response.get("outputs", {}), (height, width), obj_id=obj_id),
+                    propagated_mask = self._extract_mask(
+                        response.get("outputs", {}), (height, width), obj_id=obj_id
                     )
+                    if frame_idx in keyframe_masks:
+                        exact_mask = keyframe_masks[frame_idx]
+                        propagated_keyframe_drift[frame_idx] = int(
+                            np.count_nonzero((propagated_mask > 0) != (exact_mask > 0))
+                        )
+                        continue
+                    record_mask(frame_idx, propagated_mask)
         finally:
             self._close_session(session_id)
 
         frames_with_pixels = sum(1 for area in mask_areas.values() if area > 0)
         total_pixels = int(sum(mask_areas.values()))
+        self.last_tracking_stats = {
+            "frame_count": int(num_frames),
+            "keyframes": keyframes,
+            "keyframe_areas": {
+                int(frame_idx): int((mask > 0).sum())
+                for frame_idx, mask in keyframe_masks.items()
+            },
+            "propagated_keyframe_drift_pixels": propagated_keyframe_drift,
+            "frames_with_pixels": int(frames_with_pixels),
+            "total_pixels": total_pixels,
+        }
         print(
             f"Generated {len(final_masks)} SAM 3 masks from {len(keyframes)} keyframes; "
             f"frames_with_pixels={frames_with_pixels}/{num_frames}, total_pixels={total_pixels}, "
+            f"preserved_keyframes={len(keyframe_masks)}, "
             f"output_prob_thresh={float(output_prob_thresh):.3f}"
         )
         return final_masks
@@ -501,6 +531,47 @@ class SAM3VideoTracker:
         frames_dir.mkdir(exist_ok=True)
         try:
             Image.fromarray(frame).save(frames_dir / "00000.jpg", quality=95)
+            session_id = self._start_session(str(frames_dir))
+            try:
+                response = self._add_prompt(
+                    session_id,
+                    0,
+                    {"points": points, "labels": labels},
+                    width,
+                    height,
+                    obj_id=1,
+                    output_prob_thresh=output_prob_thresh,
+                )
+                return self._extract_mask(response.get("outputs", {}), (height, width), obj_id=1)
+            finally:
+                self._close_session(session_id)
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+    def get_frame_mask_from_path(
+        self,
+        frame_path: str,
+        points: List[List[int]],
+        labels: List[int],
+        output_prob_thresh: float = 0.5,
+    ) -> np.ndarray:
+        """Preview the exact cached JPEG bytes used by video propagation."""
+        source_path = Path(frame_path)
+        if not source_path.is_file():
+            raise ValueError(f"SAM 3 preview frame does not exist: {source_path}")
+        with Image.open(source_path) as image:
+            width, height = image.size
+
+        temp_dir = Path(tempfile.mkdtemp())
+        frames_dir = temp_dir / "frames"
+        frames_dir.mkdir(exist_ok=True)
+        try:
+            destination = frames_dir / "00000.jpg"
+            if source_path.suffix.lower() in {".jpg", ".jpeg"}:
+                shutil.copy2(source_path, destination)
+            else:
+                with Image.open(source_path) as image:
+                    image.convert("RGB").save(destination, quality=95)
             session_id = self._start_session(str(frames_dir))
             try:
                 response = self._add_prompt(

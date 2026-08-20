@@ -153,8 +153,45 @@ class ProductionUtilityTests(unittest.TestCase):
         self.assertEqual(app._sam_overlay_opacity(-1), 0.0)
         self.assertEqual(app._sam_overlay_opacity(2), 1.0)
         updates = app.resize_sam_previews(840)
-        self.assertEqual(len(updates), 4)
+        self.assertEqual(len(updates), 5)
         self.assertTrue(all(update["height"] == 840 for update in updates))
+
+    def test_maximum_detail_preset_controls_sam_and_videomama_quality(self):
+        updates = app.apply_quality_preset('Maximum Detail')
+        self.assertEqual(len(updates), 9)
+        self.assertEqual(updates[0]['value'], 0.35)
+        self.assertEqual(updates[1]['value'], 'vae')
+        self.assertEqual(updates[5]['value'], '2048x1152 (experimental)')
+        self.assertTrue(updates[6]['value'])
+        self.assertEqual(updates[7]['value'], 0)
+        self.assertTrue(updates[8]['value'])
+        self.assertEqual(
+            app.quality_preset.label,
+            'Combined SAM 3 + VideoMaMa Quality Preset',
+        )
+
+    def test_hair_detail_preset_preserves_thin_boundaries(self):
+        updates = app.apply_quality_preset('Hair Detail')
+
+        self.assertEqual(len(updates), 9)
+        self.assertEqual(updates[0]['value'], 0.2)
+        self.assertEqual(updates[5]['value'], '2048x1152 (experimental)')
+        self.assertFalse(updates[6]['value'])
+        self.assertEqual(updates[7]['value'], 8)
+        self.assertFalse(updates[8]['value'])
+
+    def test_videomama_guide_margin_adds_context_without_mutating_sam_mask(self):
+        mask = np.zeros((15, 15), dtype=np.uint8)
+        mask[7, 7] = 255
+
+        unchanged = app._expand_videomama_guide(mask, 0)
+        expanded = app._expand_videomama_guide(mask, 2)
+
+        np.testing.assert_array_equal(unchanged, mask)
+        self.assertIsNot(unchanged, mask)
+        self.assertGreater(int((expanded > 0).sum()), 1)
+        self.assertEqual(expanded[7, 7], 255)
+        self.assertEqual(int((mask > 0).sum()), 1)
 
     def test_sam_mask_inspector_has_real_zoom_controls(self):
         self.assertEqual(app.mask_img.elem_id, "sam_mask_zoom")
@@ -209,6 +246,21 @@ class ProductionUtilityTests(unittest.TestCase):
         self.assertLess(int((refined > 0).sum()), int((raw_mask > 0).sum()))
         self.assertTrue(np.all(refined[:, 32:] == 255))
 
+    def test_sam_plate_refinement_keeps_artist_point_constraints(self):
+        plate = np.zeros((40, 60, 3), dtype=np.uint8)
+        raw_mask = np.zeros((40, 60), dtype=np.uint8)
+        raw_mask[10:30, 15:45] = 255
+
+        refined = app._refine_sam_mask_against_plate(
+            plate,
+            raw_mask,
+            points=[[5, 5], [30, 20]],
+            point_labels=[1, 0],
+        )
+
+        self.assertEqual(refined[5, 5], 255)
+        self.assertEqual(refined[20, 30], 0)
+
     def test_natural_sequence_sort(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -236,6 +288,76 @@ class ProductionUtilityTests(unittest.TestCase):
         self.assertEqual(work.shape, (18, 32))
         self.assertEqual(restored.shape, source.shape)
         self.assertGreater(int(restored.sum()), 0)
+
+    def test_sam_source_crop_expands_roi_and_restores_full_frame_mask(self):
+        frame = np.zeros((80, 120, 3), dtype=np.uint8)
+        frame[20:60, 30:90] = (25, 100, 225)
+        crop_settings = app._sam_crop_settings(True, 30, 20, 60, 40)
+
+        working, transform = app._letterbox_rgb_frame(
+            frame, work_size=(90, 60), crop_settings=crop_settings
+        )
+
+        self.assertEqual(working.shape, (60, 90, 3))
+        self.assertEqual(transform['crop_x'], 30)
+        self.assertEqual(transform['crop_y'], 20)
+        self.assertEqual(transform['crop_width'], 60)
+        self.assertEqual(transform['crop_height'], 40)
+        self.assertTrue(np.all(working == (25, 100, 225)))
+
+        source_mask = app._work_mask_to_source(np.full((60, 90), 255, dtype=np.uint8), transform)
+        self.assertEqual(source_mask.shape, (80, 120))
+        self.assertTrue(np.all(source_mask[20:60, 30:90] == 255))
+        self.assertEqual(int(source_mask[:20].sum()), 0)
+        self.assertEqual(int(source_mask[:, :30].sum()), 0)
+        self.assertEqual(int(source_mask[60:].sum()), 0)
+        self.assertEqual(int(source_mask[:, 90:].sum()), 0)
+
+        round_trip = app._source_mask_to_work(source_mask, transform)
+        self.assertEqual(round_trip.shape, (60, 90))
+        self.assertTrue(np.all(round_trip == 255))
+
+    def test_artist_can_select_sam_crop_with_two_full_resolution_clicks(self):
+        self.assertEqual(app.crop_selector_btn.value, '1. Load Full-Resolution Frame')
+        self.assertEqual(app.apply_crop_btn.value, '2. Apply Selected Crop + Load Sequence')
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            source = np.zeros((80, 120, 3), dtype=np.uint8)
+            Image.fromarray(source).save(root / 'frame_0001.png')
+            preview, selector_state, message = app.load_sam_crop_selector(
+                str(root), 1.0, 0.0, 'Gamma / Exposure', 'scene_linear', '', ''
+            )
+            self.assertEqual(preview.shape, source.shape)
+            self.assertIn('120x80', message)
+
+            first = app.select_sam_crop_roi(selector_state, mock.Mock(index=(20, 15)))
+            self.assertIn('First corner', first[-1])
+            second = app.select_sam_crop_roi(first[1], mock.Mock(index=(100, 70)))
+            self.assertEqual(second[2:7], (True, 20, 15, 80, 55))
+            self.assertIn('SAM source ROI selected', second[-1])
+
+    def test_point_prompt_is_recorded_on_cropped_sam_canvas(self):
+        crop_settings = app._sam_crop_settings(True, 960, 540, 1920, 1080)
+        transform = app._sam_crop_transform(
+            3840, 2160, work_size=(1536, 864), crop_settings=crop_settings
+        )
+        state = {
+            'current_frame_idx': 0,
+            'prompts_by_frame': {},
+            'frame_transforms': [transform],
+            'work_size': [1536, 864],
+        }
+        with mock.patch.object(app, 'sam3_tracker', object()), \
+                mock.patch.object(app, '_compute_preview_mask'), \
+                mock.patch.object(app, '_invalidate_generated_results'), \
+                mock.patch.object(app, '_ui_state_payload', return_value=('updated',)):
+            result = app._add_point_at_coordinates(
+                state, 'Point keyframes', 'Positive', 0.35, 768, 432
+            )
+
+        self.assertEqual(result, ('updated',))
+        self.assertEqual(state['prompts_by_frame']['0']['points'], [[768, 432]])
+        self.assertEqual(state['prompts_by_frame']['0']['labels'], [1])
 
     def test_overlap_blend_uses_smooth_crossfade(self):
         previous = np.zeros((2, 2), dtype=np.float32)
@@ -316,6 +438,32 @@ class ProductionUtilityTests(unittest.TestCase):
 
 
 class WrapperContractTests(unittest.TestCase):
+    def test_sam_preview_uses_exact_cached_jpeg_bytes(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source_path = Path(tmpdir) / 'cached.jpg'
+            Image.fromarray(np.full((4, 6, 3), 127, dtype=np.uint8)).save(source_path, quality=91)
+            source_bytes = source_path.read_bytes()
+
+            tracker = sam3_wrapper_hf.SAM3VideoTracker.__new__(sam3_wrapper_hf.SAM3VideoTracker)
+
+            def fake_start_session(frames_dir):
+                self.assertEqual((Path(frames_dir) / '00000.jpg').read_bytes(), source_bytes)
+                return 'session'
+
+            tracker._start_session = fake_start_session
+            tracker._close_session = lambda session_id: None
+            tracker._add_prompt = lambda *args, **kwargs: {
+                'outputs': {
+                    'out_obj_ids': [1],
+                    'out_binary_masks': [np.ones((4, 6), dtype=bool)],
+                }
+            }
+
+            mask = tracker.get_frame_mask_from_path(
+                str(source_path), [[1, 1]], [1], output_prob_thresh=0.35
+            )
+            self.assertTrue(np.all(mask == 255))
+
     def test_sam31_builder_does_not_receive_legacy_gpu_ids(self):
         calls = []
         model_builder = types.ModuleType("sam3.model_builder")
@@ -447,6 +595,69 @@ class WrapperContractTests(unittest.TestCase):
             self.assertEqual(set(callbacks), {0, 1, 2})
             self.assertEqual(result, [None, None, None])
 
+    def test_sam_streaming_never_overwrites_exact_keyframe_masks(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            for index in range(4):
+                Image.fromarray(np.zeros((4, 6, 3), dtype=np.uint8)).save(root / f"{index:05d}.jpg")
+
+            tracker = sam3_wrapper_hf.SAM3VideoTracker.__new__(sam3_wrapper_hf.SAM3VideoTracker)
+            tracker._start_session = lambda frames_dir: "session"
+            tracker._close_session = lambda session_id: None
+
+            exact_masks = {
+                1: np.pad(np.ones((2, 2), dtype=bool), ((0, 2), (0, 4))),
+                3: np.pad(np.ones((2, 2), dtype=bool), ((2, 0), (4, 0))),
+            }
+            shared_output_buffer = np.zeros((4, 6), dtype=bool)
+
+            def fake_add_prompt(session_id, frame_idx, *args, **kwargs):
+                # Match SAM 3's real behavior: later prompt calls can reuse and
+                # mutate the same output storage returned for earlier frames.
+                shared_output_buffer[:] = exact_masks[frame_idx]
+                return {
+                    "outputs": {
+                        "out_obj_ids": [1],
+                        "out_binary_masks": [shared_output_buffer],
+                    }
+                }
+
+            tracker._add_prompt = fake_add_prompt
+
+            class Predictor:
+                def handle_stream_request(self, request):
+                    for frame_index in range(4):
+                        yield {
+                            "frame_index": frame_index,
+                            "outputs": {
+                                "out_obj_ids": [1],
+                                "out_binary_masks": [np.zeros((4, 6), dtype=bool)],
+                            },
+                        }
+
+            tracker.predictor = Predictor()
+            fake_torch = types.SimpleNamespace(
+                autocast=lambda **kwargs: contextlib.nullcontext(),
+                bfloat16=object(),
+            )
+            callbacks = {}
+            with mock.patch.dict(sys.modules, {"torch": fake_torch}):
+                tracker.track_video_from_dir(
+                    str(root),
+                    {
+                        1: {"points": [[1, 1]], "labels": [1]},
+                        3: {"points": [[5, 3]], "labels": [1]},
+                    },
+                    mask_callback=lambda index, mask: callbacks.__setitem__(index, mask.copy()),
+                    collect_masks=False,
+                )
+
+            np.testing.assert_array_equal(callbacks[1] > 0, exact_masks[1])
+            np.testing.assert_array_equal(callbacks[3] > 0, exact_masks[3])
+            drift = tracker.last_tracking_stats['propagated_keyframe_drift_pixels']
+            self.assertGreater(drift[1], 0)
+            self.assertGreater(drift[3], 0)
+
     def test_run_sequence_crossfades_overlap_and_records_completion(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -522,6 +733,80 @@ class WrapperContractTests(unittest.TestCase):
             manifest = app._read_run_manifest(root / "run")["videomama"]
             self.assertEqual(manifest["status"], "complete")
             self.assertEqual(manifest["completed_frame_indices"], list(range(6)))
+
+    def test_videomama_processes_sam_roi_but_writes_full_frame_alpha(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            sequence = root / 'sequence'
+            masks_dir = root / 'run' / 'sam3_masks'
+            sequence.mkdir()
+            masks_dir.mkdir(parents=True)
+            frame_path = sequence / 'frame_0000.png'
+            Image.fromarray(np.zeros((32, 32, 3), dtype=np.uint8)).save(frame_path)
+            cache_path = root / 'crop_cache.jpg'
+            Image.fromarray(np.zeros((16, 16, 3), dtype=np.uint8)).save(cache_path)
+            source_mask = np.zeros((32, 32), dtype=np.uint8)
+            source_mask[12:20, 12:20] = 255
+            Image.fromarray(source_mask).save(masks_dir / frame_path.name)
+
+            crop_settings = app._sam_crop_settings(True, 8, 8, 16, 16)
+            transform = app._sam_crop_transform(
+                32, 32, work_size=(16, 16), crop_settings=crop_settings
+            )
+            state = {
+                'sequence_dir': str(sequence),
+                'frame_paths': [str(frame_path)],
+                'frame_names': [frame_path.name],
+                'frame_sizes': [[32, 32]],
+                'frame_transforms': [transform],
+                'cache_frame_paths': [str(cache_path)],
+                'cache_dir': str(sequence),
+                'current_frame_idx': 0,
+                'text_prompt_frame_idx': 0,
+                'prompts_by_frame': {'0': {'points': [[2, 2]], 'labels': [1]}},
+                'preview_masks': {},
+                'prompt_mode': 'Point keyframes',
+                'concept_prompt': '',
+                'generated_masks_dir': str(masks_dir),
+                'generated_masks_sam_output_prob_thresh': 0.5,
+                'videomama_output_dir': None,
+                'alpha_output_dir': None,
+                'run_root': str(root / 'run'),
+                'exr_gamma': 1.0,
+                'exr_exposure': 0.0,
+                'work_size': [16, 16],
+                'sam_crop_settings': crop_settings,
+                'sam_output_prob_thresh': 0.5,
+            }
+            app._update_run_manifest(root / 'run', 'sam3', app._prompt_manifest_payload(state, 0.5))
+            received_shapes = []
+            received_masks = []
+
+            def fake_videomama(pipeline, frames, masks, **kwargs):
+                received_shapes.append((frames[0].shape, masks[0].shape))
+                received_masks.append(masks[0].copy())
+                return [np.ones((16, 16, 3), dtype=np.float32)]
+
+            fake_torch = types.SimpleNamespace(cuda=types.SimpleNamespace(is_available=lambda: False))
+            with mock.patch.dict(sys.modules, {'torch': fake_torch}), \
+                    mock.patch.object(app, '_ensure_videomama_pipeline', return_value=object()), \
+                    mock.patch.object(app, 'videomama', side_effect=fake_videomama):
+                payload = app.run_sequence(
+                    state, chunk_size=1, overlap=0, videomama_guide_expand_px=2
+                )
+
+            self.assertEqual(received_shapes, [((16, 16, 3), (16, 16))])
+            self.assertGreater(int((received_masks[0] > 0).sum()), int((source_mask[8:24, 8:24] > 0).sum()))
+            alpha_path = Path(payload[4]['alpha_output_dir']) / frame_path.name
+            alpha = np.array(Image.open(alpha_path))
+            self.assertEqual(alpha.shape, (32, 32))
+            self.assertTrue(np.all(alpha[8:24, 8:24] == 65535))
+            self.assertEqual(int(alpha[:8].sum()), 0)
+            self.assertEqual(int(alpha[:, :8].sum()), 0)
+            self.assertEqual(int(alpha[24:].sum()), 0)
+            self.assertEqual(int(alpha[:, 24:].sum()), 0)
+            manifest = app._read_run_manifest(root / 'run')['videomama']
+            self.assertEqual(manifest['guide_expand_px'], 2)
 
 
 if __name__ == "__main__":

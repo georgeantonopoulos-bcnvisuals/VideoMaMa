@@ -34,10 +34,13 @@ For production rotoscoping, use `production_frame_app.py` through
 1. Bootstrap with `bash scripts/bootstrap_tmp_venv.sh` and authenticate the UI
    venv for the gated `facebook/sam3` or `facebook/sam3.1` checkpoint.
 2. Launch `bash scripts/run_production_frame_ui.sh`.
-3. Load an image/EXR sequence directory and add point keyframes or a text concept.
-4. Generate SAM 3 masks for the full sequence.
-5. Run VideoMaMa over the full shot or an inclusive frame range.
-6. Review 8-bit previews under `videomama_frames` and use the production alpha
+3. Optionally open **SAM Source ROI Crop**, load a full-resolution selector frame,
+   and click two opposite corners. The fixed source ROI is cropped before it is
+   resized to the SAM canvas, increasing effective detail on the subject.
+4. Load the image/EXR sequence directory and add point keyframes or a text concept.
+5. Generate SAM 3 masks for the full sequence.
+6. Run VideoMaMa over the full shot or an inclusive frame range.
+7. Review 8-bit previews under `videomama_frames` and use the production alpha
    from `alpha_frames` (16-bit PNG, half EXR, or both).
 
 Runs are saved under `tmp/production_sequence_app`, with a manifest recording
@@ -45,6 +48,17 @@ source fingerprints, prompts, model settings, generated frames, and completion
 status. Chunk overlaps are cross-faded to reduce visible range boundaries.
 EXR previews may use the simple exposure/gamma transform or the server's active
 `OCIO` configuration with an input colorspace, display, and view.
+When an ROI is enabled, both SAM 3 and VideoMaMa process that source crop at the
+selected working resolution; their masks/mattes are then mapped back into
+full-resolution, full-frame outputs. This avoids shrinking the entire 4K plate
+when only a smaller subject region needs detail.
+
+The combined quality preset affects both stages: its threshold changes SAM 3,
+while its processing resolution and plate-edge refinement change VideoMaMa.
+`Maximum Detail` selects 2048x1152 processing and is the highest-VRAM option.
+`Hair Detail` also uses 2048x1152, preserves SAM 3's raw irregular boundary,
+disables both plate-smoothing passes, and expands only the VideoMaMa conditioning
+guide by 8 source pixels so nearby wisps are not excluded before matting.
 
 ## 🚀 Legacy Uploaded-Video Demo
 

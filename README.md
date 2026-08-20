@@ -44,7 +44,9 @@ VideoMaMa is an open-source project. If you find our work helpful, please consid
 This fork includes a production sequence UI that combines multi-keyframe SAM 3
 tracking with VideoMaMa matting. It supports image/EXR sequences, letterboxed
 prompting, resumable runs, selected frame ranges, overlap cross-fading, and
-16-bit PNG or half-float EXR alpha output.
+16-bit PNG or half-float EXR alpha output. Artists can also select a fixed ROI
+on a full-resolution source frame so SAM 3 receives a crop-first, higher-detail
+view while masks and mattes remain full-frame.
 
 On the Rocky production servers, use the split runtime bootstrap:
 
