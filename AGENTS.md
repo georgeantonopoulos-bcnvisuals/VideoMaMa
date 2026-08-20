@@ -4,10 +4,12 @@
 
 This repository is a working fork of VideoMaMa, "Mask-Guided Video Matting via Generative Prior." It contains the upstream training and inference code plus a custom production UI/harness that combines SAM 3 mask tracking with a selectable matting backend over image or EXR sequences.
 
-SAM 3 / 3.1 does tracking. The matte itself comes from a **matting backend**:
-SAM2Matting SAM2.1 Base+ by default, with VideoMaMa retained as an alternative
-and rescue path. See `docs/sam2matting.md` for the full design, validation
-results and the A/B comparison procedure.
+SAM 3 / 3.1 creates the initial masks. The matte itself comes from a **matting
+backend**: SAM2Matting SAM2.1 Base+ by default, with VideoMaMa retained as an
+alternative and rescue path. VideoMaMa can follow either the generated SAM 3
+masks directly or a cached SAM2Matting propagation pre-pass. See
+`docs/sam2matting.md` for the full design, validation results and comparison
+procedure.
 
 Core pieces:
 
@@ -188,14 +190,27 @@ heads without moving it to the compute device. `_DeviceFrameView` in
 5. Uses `sam3_wrapper_hf.SAM3VideoTracker.track_video_from_dir()` to propagate masks across the cached sequence.
 6. Saves masks under `sam3_masks` at source resolution.
 7. Resolves the **matte ROI** (auto from those masks, manual SAM crop override, or full frame).
-8. Runs the selected **matting backend** over the requested range.
-9. Saves outputs under that backend's directories and grayscale alpha previews alongside them.
+8. If VideoMaMa uses a SAM2Matting guide source, runs/caches that propagation
+   pre-pass and thresholds its soft alpha into VideoMaMa's categorical guide.
+9. Runs the selected **matting backend** over the requested range.
+10. Saves outputs under that backend's directories and grayscale alpha previews alongside them.
 
 ### Matting Backends
 
 - `SAM2Matting SAM2.1 Base+` (default) -> `matte_frames_s2m_base_plus/`, `alpha_frames_s2m_base_plus/`
 - `VideoMaMa` -> `videomama_frames/`, `alpha_frames/` (unchanged, still the rescue/comparison path)
 - `SAM2Matting SAM2.1 Tiny` and `SAM2Matting SAM3 tracker` -> experimental, own directories
+
+VideoMaMa's **Guide Source** is independent of its final-backend choice:
+
+- `SAM 3 / SAM 3.1 generated masks` -> historical direct VideoMaMa workflow.
+- Any SAM2Matting variant -> cached isolated-worker alpha pre-pass, thresholded
+  to the binary/categorical guide VideoMaMa expects, then VideoMaMa inference.
+
+The unthresholded 16-bit guide alpha is cached under `videomama_guides/`, so
+changing only the guide threshold does not rerun SAM2Matting. Guide backend,
+checkpoint/runtime identity, propagation settings, ROI, selected range, SAM
+prompt identity, and threshold all participate in the final cache identity.
 
 Per-backend directories exist so an A/B never overwrites its own baseline. Do not
 apply the GrabCut / guided-filter refinements to SAM2Matting output: predicting
@@ -385,6 +400,9 @@ Starting the UI or running inference can require GPU access and large checkpoint
   lightweight QC. SAM2Matting runs in an isolated venv and process, pinned to
   upstream `73dd721d`. Full design, measurements and the A/B procedure are in
   `docs/sam2matting.md`.
+- 2026-08-20: VideoMaMa can now choose SAM 3 masks or any SAM2Matting variant as
+  its guide source. SAM2Matting guides run as an isolated cached pre-pass; the
+  direct SAM2Matting matte backend remains available independently.
 
 - 2026-06-15: `demo/production_frame_app.py` has a "Clear Sequence Cache + Reload" button that deletes the current per-sequence tmp run under `tmp/production_sequence_app/` and reloads without resuming.
 - 2026-06-15: SAM 3 masks are still tracked on the 1024x576 UI/SAM working cache, but saved to `sam3_masks/` at each source frame's original resolution; previews downsample masks back to working size for overlay.

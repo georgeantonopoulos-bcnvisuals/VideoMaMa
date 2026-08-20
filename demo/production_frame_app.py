@@ -129,6 +129,13 @@ POINT_ALPHA = 0.9
 POINT_RADIUS = 15
 SUPPORTED_IMAGE_EXTS = {".exr", ".png", ".jpg", ".jpeg", ".tif", ".tiff"}
 ALPHA_OUTPUT_FORMATS = ('16-bit PNG', 'Half EXR', 'Both')
+VIDEOMAMA_GUIDE_SAM3 = 'SAM 3 / SAM 3.1 generated masks'
+VIDEOMAMA_GUIDE_SOURCES = (
+    VIDEOMAMA_GUIDE_SAM3,
+    mb.SAM2MATTING_BASE_PLUS.label,
+    mb.SAM2MATTING_TINY.label,
+    mb.SAM2MATTING_SAM3.label,
+)
 
 # The matte ROI is resolved at matting time, unlike the load-time SAM ROI crop:
 # it can be derived from masks that do not exist until SAM 3 has run.
@@ -167,6 +174,8 @@ DEFAULT_SETTINGS = {
     'videomama_motion_bucket_id': 127,
     'videomama_noise_aug_strength': 0.0,
     'videomama_guide_expand_px': 0,
+    'videomama_guide_source': VIDEOMAMA_GUIDE_SAM3,
+    'videomama_guide_threshold': 0.5,
     'processing_resolution': DEFAULT_PROCESSING_RESOLUTION,
     'sam_crop_enabled': False,
     'sam_crop_x': 0,
@@ -176,6 +185,7 @@ DEFAULT_SETTINGS = {
     'refine_edges_against_plate': False,
     'tracking_model': os.environ.get('SAM3_MODEL_VERSION', 'sam3'),
     'matting_backend': mb.SAM2MATTING_BASE_PLUS.label,
+    's2m_backend': mb.SAM2MATTING_BASE_PLUS.label,
     'matte_roi_mode': MATTE_ROI_MODES[0],
     'matte_roi_padding': DEFAULT_MATTE_ROI_PADDING,
     'matte_roi_min_gain': DEFAULT_MATTE_ROI_MIN_GAIN,
@@ -685,10 +695,12 @@ def _save_ui_settings(sequence_dir, exr_gamma, exr_exposure, exr_color_mode,
                       sam_refine_edges_against_plate,
                       videomama_mask_cond_mode,
                       videomama_seed, videomama_fps, videomama_motion_bucket_id,
-                      videomama_noise_aug_strength, videomama_guide_expand_px, processing_resolution,
+                      videomama_noise_aug_strength, videomama_guide_expand_px,
+                      videomama_guide_source, videomama_guide_threshold, processing_resolution,
                       sam_crop_enabled, sam_crop_x, sam_crop_y, sam_crop_width, sam_crop_height,
                       refine_edges_against_plate,
-                      tracking_model, matting_backend, matte_roi_mode, matte_roi_padding, matte_roi_min_gain,
+                      tracking_model, matting_backend, s2m_backend,
+                      matte_roi_mode, matte_roi_padding, matte_roi_min_gain,
                       s2m_conditioning, s2m_guidance_interval, s2m_frame_cap,
                       s2m_window_size, s2m_window_overlap, s2m_offload, s2m_bf16, matte_qc_enabled,
                       free_gpu_after_run, alpha_output_format, chunk_size, overlap,
@@ -717,6 +729,8 @@ def _save_ui_settings(sequence_dir, exr_gamma, exr_exposure, exr_color_mode,
         'videomama_motion_bucket_id': int(videomama_motion_bucket_id),
         'videomama_noise_aug_strength': float(videomama_noise_aug_strength),
         'videomama_guide_expand_px': _videomama_guide_expand_px(videomama_guide_expand_px),
+        'videomama_guide_source': str(videomama_guide_source or VIDEOMAMA_GUIDE_SAM3),
+        'videomama_guide_threshold': _videomama_guide_threshold(videomama_guide_threshold),
         'processing_resolution': str(processing_resolution or DEFAULT_PROCESSING_RESOLUTION),
         'sam_crop_enabled': bool(sam_crop_enabled),
         'sam_crop_x': int(sam_crop_x or 0),
@@ -726,6 +740,7 @@ def _save_ui_settings(sequence_dir, exr_gamma, exr_exposure, exr_color_mode,
         'refine_edges_against_plate': bool(refine_edges_against_plate),
         'tracking_model': str(tracking_model or 'sam3'),
         'matting_backend': mb.resolve_backend(matting_backend).label,
+        's2m_backend': mb.resolve_backend(s2m_backend).label,
         'matte_roi_mode': str(matte_roi_mode or MATTE_ROI_MODES[0]),
         'matte_roi_padding': float(matte_roi_padding),
         'matte_roi_min_gain': float(matte_roi_min_gain),
@@ -886,10 +901,28 @@ def _backend_info_markdown(matting_backend):
     return '\n\n'.join(lines)
 
 
-def _select_sam2matting_backend(matting_backend):
-    """Keep the selected SAM2Matting variant, or switch to the production default."""
+def _videomama_guide_spec(guide_source):
+    """Resolve a VideoMaMa guide choice to a SAM2Matting spec, or None for SAM 3."""
+    value = str(guide_source or VIDEOMAMA_GUIDE_SAM3)
+    if value == VIDEOMAMA_GUIDE_SAM3:
+        return None
     try:
-        spec = mb.resolve_backend(matting_backend)
+        spec = mb.resolve_backend(value)
+    except ValueError as exc:
+        raise ValueError(f'Unsupported VideoMaMa guide source: {guide_source}') from exc
+    if spec.family != 'sam2matting':
+        raise ValueError(f'VideoMaMa guide source is not SAM2Matting: {guide_source}')
+    return spec
+
+
+def _videomama_guide_threshold(value):
+    return max(0.01, min(float(value), 0.99))
+
+
+def _select_sam2matting_backend(s2m_backend):
+    """Select the requested SAM2Matting variant for the model-specific run."""
+    try:
+        spec = mb.resolve_backend(s2m_backend)
     except ValueError:
         spec = mb.SAM2MATTING_BASE_PLUS
     if spec.family != 'sam2matting':
@@ -3042,14 +3075,17 @@ def _roi_identity(roi):
     }
 
 
-def _qc_frame(state, frame_idx, alpha):
-    """Screen one frame by comparing the alpha's support against the SAM 3 mask."""
-    masks_dir = Path(state.get('generated_masks_dir') or '')
-    mask_path = masks_dir / f"{Path(state['frame_names'][frame_idx]).stem}.png"
-    if not mask_path.is_file():
-        return None
-    with Image.open(mask_path) as image:
-        mask = np.array(image.convert('L'))
+def _qc_frame(state, frame_idx, alpha, guide_loader=None):
+    """Screen one frame against the guide mask that produced the matte."""
+    if guide_loader is not None:
+        mask = guide_loader(frame_idx)
+    else:
+        masks_dir = Path(state.get('generated_masks_dir') or '')
+        mask_path = masks_dir / f"{Path(state['frame_names'][frame_idx]).stem}.png"
+        if not mask_path.is_file():
+            return None
+        with Image.open(mask_path) as image:
+            mask = np.array(image.convert('L'))
     return matte_qc.frame_metrics(
         _qc_downsample(mask, nearest=True), _qc_downsample(alpha)
     )
@@ -3115,7 +3151,7 @@ class _MatteSink:
 
 
 def _run_videomama_pass(state, sink, roi, range_start, range_end, work_size,
-                        chunk_size, overlap, params, progress):
+                        chunk_size, overlap, params, progress, guide_loader=None):
     """The original chunked VideoMaMa matting loop, unchanged in behaviour.
 
     Kept intact deliberately: it is the rescue/comparison path and must keep
@@ -3142,7 +3178,8 @@ def _run_videomama_pass(state, sink, roi, range_start, range_end, work_size,
         frame_indices = list(range(start, end))
 
         source_frames_np = [_load_state_rgb_frame(state, idx) for idx in frame_indices]
-        source_masks_np = [_load_state_sam_mask(state, idx) for idx in frame_indices]
+        load_guide = guide_loader or (lambda idx: _load_state_sam_mask(state, idx))
+        source_masks_np = [load_guide(idx) for idx in frame_indices]
 
         # Give VideoMaMa the same ROI the rest of the pipeline agreed on. On a
         # 4K plate this preserves far more subject detail than shrinking the
@@ -3350,12 +3387,107 @@ def _read_matte_manifest(run_root: Path):
     return legacy
 
 
+def _sam2matting_params(conditioning, guidance_interval, frame_cap, window_size,
+                        window_overlap, offload, bf16):
+    return mb.SAM2MattingParams(
+        conditioning=mb.resolve_conditioning(conditioning),
+        guidance_interval=guidance_interval,
+        frame_long_edge_cap=frame_cap,
+        window_size=window_size,
+        window_overlap=window_overlap,
+        offload_video_to_cpu=bool(offload),
+        offload_state_to_cpu=bool(offload),
+        bf16=bool(bf16),
+    ).normalized()
+
+
+def _videomama_guide_cache(run_root, state, spec, params, runtime, roi,
+                            sam_manifest, range_start, range_end, progress):
+    """Return a loader for cached SAM2Matting-propagated VideoMaMa guides.
+
+    SAM2Matting emits a soft alpha, while VideoMaMa was trained with a categorical
+    mask. The caller applies the artist-selected threshold when loading each
+    cached alpha. Keeping the unthresholded 16-bit alpha makes threshold changes
+    cheap and avoids rerunning the SAM2Matting worker.
+    """
+    guide_identity = {
+        'source': mb.backend_identity(spec, params, runtime),
+        'sam_prompt_hash': sam_manifest.get('prompt_hash'),
+        'sam_model_version': sam_manifest.get('model_version'),
+        'matte_roi': _roi_identity(roi),
+        # SAM2Matting propagation is range/window dependent: endpoints are
+        # conditioning frames, so the same frame can legitimately differ when
+        # generated as part of a different selected range.
+        'range': [int(range_start), int(range_end)],
+    }
+    settings_hash = _stable_json_hash(guide_identity)
+    cache_root = Path(run_root) / 'videomama_guides' / spec.output_slug / settings_hash[:16]
+    preview_dir = cache_root / 'preview'
+    alpha_dir = cache_root / 'alpha'
+    expected = [alpha_dir / f"{Path(state['frame_names'][idx]).stem}.png"
+                for idx in range(range_start, range_end + 1)]
+
+    if not all(path.is_file() for path in expected):
+        preview_dir.mkdir(parents=True, exist_ok=True)
+        alpha_dir.mkdir(parents=True, exist_ok=True)
+        _append_debug_line(
+            f"Generating {spec.label} guide pre-pass for VideoMaMa frames "
+            f"[{range_start}, {range_end}]."
+        )
+        sink = _MatteSink(
+            preview_dir, alpha_dir, state['frame_names'], '16-bit PNG', qc_enabled=False
+        )
+        _run_sam2matting_pass(
+            state, sink, roi, range_start, range_end, spec, params, runtime, progress
+        )
+        if sorted(sink.written) != list(range(range_start, range_end + 1)):
+            raise RuntimeError(
+                f"{spec.label} guide pre-pass wrote unexpected frames: {sorted(sink.written)}."
+            )
+    else:
+        _append_debug_line(
+            f"Reusing cached {spec.label} VideoMaMa guide for frames "
+            f"[{range_start}, {range_end}]."
+        )
+
+    completed = sorted(
+        idx for idx, frame_name in enumerate(state['frame_names'])
+        if (alpha_dir / f"{Path(frame_name).stem}.png").is_file()
+    )
+    _update_run_manifest(Path(run_root), 'videomama_guide', {
+        'status': 'complete',
+        'backend_id': spec.backend_id,
+        'backend_label': spec.label,
+        'settings_hash': settings_hash,
+        'identity': guide_identity,
+        'alpha_dir': str(alpha_dir),
+        'completed_frame_indices': completed,
+    })
+    return {
+        'spec': spec,
+        'settings_hash': settings_hash,
+        'alpha_dir': alpha_dir,
+    }
+
+
+def _load_videomama_sam2matting_guide(state, guide_context, frame_idx, threshold):
+    path = Path(guide_context['alpha_dir']) / f"{Path(state['frame_names'][frame_idx]).stem}.png"
+    if not path.is_file():
+        raise RuntimeError(f'Missing cached SAM2Matting VideoMaMa guide: {path}')
+    with Image.open(path) as image:
+        alpha = np.asarray(image, dtype=np.float32)
+    maximum = float(alpha.max()) if alpha.size else 0.0
+    peak = float(np.iinfo(np.uint16).max if maximum > 255.0 else 255.0)
+    return ((alpha / peak) >= _videomama_guide_threshold(threshold)).astype(np.uint8) * 255
+
+
 @_serialized_gpu_job
 def run_sequence(state, chunk_size, overlap, range_start=0, range_end=-1, custom_output_dir='',
                  prompt_mode=None, concept_prompt=None, sam_output_prob_thresh=0.5,
                  videomama_mask_cond_mode='vae', videomama_seed=42, videomama_fps=7,
                  videomama_motion_bucket_id=127, videomama_noise_aug_strength=0.0,
-                 videomama_guide_expand_px=0,
+                 videomama_guide_expand_px=0, videomama_guide_source=VIDEOMAMA_GUIDE_SAM3,
+                 videomama_guide_threshold=0.5,
                  processing_resolution=None,
                  sam_crop_enabled=None, sam_crop_x=0, sam_crop_y=0,
                  sam_crop_width=0, sam_crop_height=0,
@@ -3419,17 +3551,12 @@ def run_sequence(state, chunk_size, overlap, range_start=0, range_end=-1, custom
     _append_debug_line(f"Matte ROI: {roi.get('reason')} -> {_roi_identity(roi)}")
 
     runtime = {}
+    guide_context = None
     if spec.family == 'sam2matting':
-        params = mb.SAM2MattingParams(
-            conditioning=mb.resolve_conditioning(s2m_conditioning),
-            guidance_interval=s2m_guidance_interval,
-            frame_long_edge_cap=s2m_frame_cap,
-            window_size=s2m_window_size,
-            window_overlap=s2m_window_overlap,
-            offload_video_to_cpu=bool(s2m_offload),
-            offload_state_to_cpu=bool(s2m_offload),
-            bf16=bool(s2m_bf16),
-        ).normalized()
+        params = _sam2matting_params(
+            s2m_conditioning, s2m_guidance_interval, s2m_frame_cap,
+            s2m_window_size, s2m_window_overlap, s2m_offload, s2m_bf16,
+        )
         try:
             runtime = sam2matting_client.preflight(REPO_ROOT, spec, _checkpoints_root())
         except sam2matting_client.SAM2MattingError as exc:
@@ -3438,6 +3565,31 @@ def run_sequence(state, chunk_size, overlap, range_start=0, range_end=-1, custom
         _unload_sam3_tracker()
         _unload_videomama_pipeline()
     else:
+        try:
+            guide_spec = _videomama_guide_spec(videomama_guide_source)
+        except ValueError as exc:
+            raise gr.Error(str(exc)) from exc
+        guide_threshold = _videomama_guide_threshold(videomama_guide_threshold)
+        if guide_spec is not None:
+            guide_params = _sam2matting_params(
+                s2m_conditioning, s2m_guidance_interval, s2m_frame_cap,
+                s2m_window_size, s2m_window_overlap, s2m_offload, s2m_bf16,
+            )
+            try:
+                guide_runtime = sam2matting_client.preflight(
+                    REPO_ROOT, guide_spec, _checkpoints_root()
+                )
+            except sam2matting_client.SAM2MattingError as exc:
+                raise gr.Error(str(exc)) from exc
+            _unload_sam3_tracker()
+            _unload_videomama_pipeline()
+            try:
+                guide_context = _videomama_guide_cache(
+                    run_root, state, guide_spec, guide_params, guide_runtime, roi,
+                    saved_sam_manifest, range_start, range_end, progress,
+                )
+            except sam2matting_client.SAM2MattingError as exc:
+                raise gr.Error(_sam2matting_error_help(exc)) from exc
         chunk_size = max(1, int(chunk_size))
         overlap = max(0, int(overlap))
         if overlap >= chunk_size:
@@ -3452,6 +3604,10 @@ def run_sequence(state, chunk_size, overlap, range_start=0, range_end=-1, custom
             motion_bucket_id=max(0, min(int(videomama_motion_bucket_id), 255)),
             noise_aug_strength=max(0.0, min(float(videomama_noise_aug_strength), 1.0)),
             guide_expand_px=_videomama_guide_expand_px(videomama_guide_expand_px),
+            guide_source=(guide_spec.backend_id if guide_spec else 'sam3'),
+            guide_threshold=guide_threshold,
+            guide_backend_id=(guide_spec.backend_id if guide_spec else ''),
+            guide_settings_hash=(guide_context['settings_hash'] if guide_context else ''),
             chunk_size=chunk_size,
             overlap=overlap,
             refine_edges_against_plate=bool(refine_edges_against_plate),
@@ -3468,6 +3624,9 @@ def run_sequence(state, chunk_size, overlap, range_start=0, range_end=-1, custom
         'status': 'running',
         'backend_id': spec.backend_id,
         'backend_label': spec.label,
+        'guide_source': (
+            params.guide_source if spec.family == 'videomama' else 'sam3-conditioning'
+        ),
         'range': [range_start, range_end],
         'identity': identity,
         'matte_roi': _roi_identity(roi),
@@ -3509,10 +3668,16 @@ def run_sequence(state, chunk_size, overlap, range_start=0, range_end=-1, custom
         f"params={identity['params']}"
     )
 
+    guide_loader = None
+    if guide_context is not None:
+        guide_loader = lambda idx: _load_videomama_sam2matting_guide(
+            state, guide_context, idx, params.guide_threshold
+        )
+
     sink = _MatteSink(
         output_dir, alpha_dir, state['frame_names'], alpha_output_format,
         qc_enabled=bool(matte_qc_enabled),
-        qc_hook=lambda idx, alpha: _qc_frame(state, idx, alpha),
+        qc_hook=lambda idx, alpha: _qc_frame(state, idx, alpha, guide_loader),
     )
     try:
         if spec.family == 'sam2matting':
@@ -3522,7 +3687,8 @@ def run_sequence(state, chunk_size, overlap, range_start=0, range_end=-1, custom
         else:
             processed = _run_videomama_pass(
                 state, sink, roi, range_start, range_end, work_size,
-                params.chunk_size, params.overlap, params, progress
+                params.chunk_size, params.overlap, params, progress,
+                guide_loader=guide_loader,
             )
 
         expected_indices = list(range(range_start, range_end + 1))
@@ -3755,16 +3921,13 @@ with gr.Blocks(title='VideoMaMa Production Sequence App', css=APP_CSS, js=APP_JS
                     gr.Markdown(
                         'SAM2Matting consumes the generated **SAM 3 masks** and produces the soft alpha matte.'
                     )
-                    matting_backend = gr.Dropdown(
-                        mb.backend_labels(),
-                        value=_settings['matting_backend'],
-                        label='Matting Backend / SAM2Matting Variant',
-                        info=(
-                            'Choose a SAM2Matting variant here. The model-specific button below keeps '
-                            'that variant, or selects Base+ if VideoMaMa is currently selected.'
-                        ),
+                    s2m_backend = gr.Dropdown(
+                        list(VIDEOMAMA_GUIDE_SOURCES[1:]),
+                        value=_settings['s2m_backend'],
+                        label='SAM2Matting Variant',
+                        info='Used for direct SAM2Matting matte generation in this tab.',
                     )
-                    backend_info = gr.Markdown(_backend_info_markdown(_settings['matting_backend']))
+                    s2m_backend_info = gr.Markdown(_backend_info_markdown(_settings['s2m_backend']))
                     s2m_conditioning = gr.Dropdown(
                         list(mb.CONDITIONING_STRATEGIES.keys()),
                         value=_settings['s2m_conditioning'],
@@ -3817,7 +3980,23 @@ with gr.Blocks(title='VideoMaMa Production Sequence App', css=APP_CSS, js=APP_JS
                         ),
                     )
                     gr.Markdown(
-                        '**Hair workflow:** SAM supplies a binary guide; VideoMaMa creates the soft alpha.'
+                        '**Guide workflow:** choose whether VideoMaMa follows the generated SAM 3 masks '
+                        'directly or first runs SAM2Matting tracking and uses its propagated result.'
+                    )
+                    videomama_guide_source = gr.Dropdown(
+                        list(VIDEOMAMA_GUIDE_SOURCES),
+                        value=_settings['videomama_guide_source'],
+                        label='VideoMaMa Guide Source',
+                        info=(
+                            'SAM2Matting sources run as a cached pre-pass, then their alpha is thresholded '
+                            'into the categorical mask expected by VideoMaMa.'
+                        ),
+                    )
+                    videomama_guide_threshold = gr.Slider(
+                        label='SAM2Matting → VideoMaMa Guide Threshold',
+                        minimum=0.01, maximum=0.99, step=0.01,
+                        value=_settings['videomama_guide_threshold'],
+                        info='Only used when a SAM2Matting guide source is selected.',
                     )
                     videomama_mask_cond_mode = gr.Radio(
                         ['vae', 'interpolate'], value=_settings['videomama_mask_cond_mode'],
@@ -3903,7 +4082,17 @@ with gr.Blocks(title='VideoMaMa Production Sequence App', css=APP_CSS, js=APP_JS
                     free_gpu_after_run = gr.Checkbox(
                         label='Free GPU After Run', value=_settings['free_gpu_after_run']
                     )
-                    run_btn = gr.Button('Generate Matte (Selected Range)', variant='primary')
+                    gr.Markdown(
+                        '**Generic run:** the model tabs have dedicated buttons. This selector and button '
+                        'provide the same shared runner when you want to choose the backend here instead.'
+                    )
+                    matting_backend = gr.Dropdown(
+                        mb.backend_labels(),
+                        value=_settings['matting_backend'],
+                        label='Generic Matte Backend',
+                    )
+                    backend_info = gr.Markdown(_backend_info_markdown(_settings['matting_backend']))
+                    run_btn = gr.Button('Generate Matte Using Backend Above', variant='primary')
                     unload_models_btn = gr.Button('Unload Models / Free GPU')
                     mask_dir = gr.Textbox(label='Mask Directory', interactive=False)
                     output_dir = gr.Textbox(label='Matte Output Directory', interactive=False)
@@ -4044,10 +4233,12 @@ with gr.Blocks(title='VideoMaMa Production Sequence App', css=APP_CSS, js=APP_JS
         sam_refine_edges_against_plate,
         videomama_mask_cond_mode,
         videomama_seed, videomama_fps, videomama_motion_bucket_id,
-        videomama_noise_aug_strength, videomama_guide_expand_px, processing_resolution,
+        videomama_noise_aug_strength, videomama_guide_expand_px,
+        videomama_guide_source, videomama_guide_threshold, processing_resolution,
         sam_crop_enabled, sam_crop_x, sam_crop_y, sam_crop_width, sam_crop_height,
         refine_edges_against_plate,
-        tracking_model, matting_backend, matte_roi_mode, matte_roi_padding, matte_roi_min_gain,
+        tracking_model, matting_backend, s2m_backend,
+        matte_roi_mode, matte_roi_padding, matte_roi_min_gain,
         s2m_conditioning, s2m_guidance_interval, s2m_frame_cap,
         s2m_window_size, s2m_window_overlap, s2m_offload, s2m_bf16, matte_qc_enabled,
         free_gpu_after_run, alpha_output_format, chunk_size, overlap,
@@ -4227,7 +4418,7 @@ with gr.Blocks(title='VideoMaMa Production Sequence App', css=APP_CSS, js=APP_JS
         prompt_mode, concept_prompt, sam_output_prob_thresh,
         videomama_mask_cond_mode, videomama_seed, videomama_fps,
         videomama_motion_bucket_id, videomama_noise_aug_strength,
-        videomama_guide_expand_px,
+        videomama_guide_expand_px, videomama_guide_source, videomama_guide_threshold,
         processing_resolution,
         sam_crop_enabled, sam_crop_x, sam_crop_y, sam_crop_width, sam_crop_height,
         refine_edges_against_plate, free_gpu_after_run,
@@ -4240,7 +4431,7 @@ with gr.Blocks(title='VideoMaMa Production Sequence App', css=APP_CSS, js=APP_JS
     run_btn.click(run_sequence, inputs=matte_run_inputs, outputs=ui_outputs)
     generate_sam2matting_btn.click(
         _select_sam2matting_backend,
-        inputs=matting_backend,
+        inputs=s2m_backend,
         outputs=[matting_backend, backend_info],
         queue=False,
     ).then(run_sequence, inputs=matte_run_inputs, outputs=ui_outputs)
@@ -4259,6 +4450,12 @@ with gr.Blocks(title='VideoMaMa Production Sequence App', css=APP_CSS, js=APP_JS
         _backend_info_markdown,
         inputs=matting_backend,
         outputs=backend_info,
+        queue=False,
+    )
+    s2m_backend.change(
+        _backend_info_markdown,
+        inputs=s2m_backend,
+        outputs=s2m_backend_info,
         queue=False,
     )
 

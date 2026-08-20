@@ -147,6 +147,15 @@ class ClearSequenceCacheTests(unittest.TestCase):
 
 
 class ProductionUtilityTests(unittest.TestCase):
+    def test_videomama_guide_source_resolves_sam3_and_sam2matting(self):
+        self.assertIsNone(app._videomama_guide_spec(app.VIDEOMAMA_GUIDE_SAM3))
+        self.assertIs(
+            app._videomama_guide_spec(app.mb.SAM2MATTING_BASE_PLUS.label),
+            app.mb.SAM2MATTING_BASE_PLUS,
+        )
+        with self.assertRaises(ValueError):
+            app._videomama_guide_spec('not a guide source')
+
     def test_model_specific_run_buttons_select_the_expected_backend(self):
         backend_update, backend_info = app._select_sam2matting_backend(
             app.mb.VIDEOMAMA_BACKEND.label
@@ -172,6 +181,14 @@ class ProductionUtilityTests(unittest.TestCase):
         self.assertEqual(
             app.generate_videomama_btn.value,
             'Generate VideoMaMa Matte (Selected Range)',
+        )
+        self.assertEqual(
+            app.run_btn.value,
+            'Generate Matte Using Backend Above',
+        )
+        self.assertIn(
+            app.mb.SAM2MATTING_BASE_PLUS.label,
+            [choice[0] for choice in app.videomama_guide_source.choices],
         )
 
     def test_sam_preview_controls_are_bounded(self):

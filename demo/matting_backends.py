@@ -325,6 +325,10 @@ class VideoMaMaParams:
     motion_bucket_id: int = 127
     noise_aug_strength: float = 0.0
     guide_expand_px: int = 0
+    guide_source: str = "sam3"
+    guide_threshold: float = 0.5
+    guide_backend_id: str = ""
+    guide_settings_hash: str = ""
     chunk_size: int = 16
     overlap: int = 4
     refine_edges_against_plate: bool = False

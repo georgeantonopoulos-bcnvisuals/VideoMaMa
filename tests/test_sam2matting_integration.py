@@ -82,6 +82,20 @@ class BackendRegistryTests(unittest.TestCase):
         )
         self.assertNotEqual(mb.stable_hash(first), mb.stable_hash(second))
 
+    def test_videomama_identity_records_its_guide_source(self):
+        sam3 = mb.backend_identity(
+            mb.VIDEOMAMA_BACKEND, mb.VideoMaMaParams(guide_source="sam3")
+        )
+        sam2matting = mb.backend_identity(
+            mb.VIDEOMAMA_BACKEND,
+            mb.VideoMaMaParams(
+                guide_source=mb.SAM2MATTING_BASE_PLUS.backend_id,
+                guide_backend_id=mb.SAM2MATTING_BASE_PLUS.backend_id,
+                guide_settings_hash="guide-hash",
+            ),
+        )
+        self.assertNotEqual(mb.stable_hash(sam3), mb.stable_hash(sam2matting))
+
 
 # --------------------------------------------------------------------------
 # Conditioning strategy
@@ -931,6 +945,45 @@ class BackendIsolationTests(unittest.TestCase):
         self.assertTrue(vm_dir.is_dir())
         self.assertEqual(len(list(s2m_dir.glob("*.png"))), 3)
         self.assertEqual(len(list(vm_dir.glob("*.png"))), 3)
+
+    def test_videomama_can_use_a_cached_sam2matting_guide_prepass(self):
+        state = _build_state(self.root, frame_count=3)
+        worker = _StubWorker(alpha_value=0.75)
+        received_masks = []
+
+        def fake_videomama(_pipeline, frames, masks, **_):
+            received_masks.extend(mask.copy() for mask in masks)
+            return [np.full((*frame.shape[:2], 3), 0.25, dtype=np.float32) for frame in frames]
+
+        with mock.patch.object(client, "preflight", return_value=self.runtime), \
+                mock.patch.object(client.subprocess, "Popen", side_effect=worker.popen), \
+                mock.patch.object(app, "_ensure_videomama_pipeline", return_value=object()), \
+                mock.patch.object(app, "videomama", side_effect=fake_videomama):
+            run_kwargs = dict(
+                chunk_size=4, overlap=0, matting_backend="videomama",
+                videomama_guide_source=mb.SAM2MATTING_BASE_PLUS.label,
+                videomama_guide_threshold=0.5, progress=lambda *a, **k: None,
+            )
+            payload = app.run_sequence(state, **run_kwargs)
+            first_job_count = len(worker.jobs)
+            app.run_sequence(state, **run_kwargs)
+
+        self.assertTrue(worker.jobs)
+        self.assertEqual(len(worker.jobs), first_job_count)
+        self.assertEqual(len(received_masks), 6)
+        self.assertTrue(all(np.all(mask == 255) for mask in received_masks))
+        manifest = app._read_run_manifest(self.root / "run")
+        self.assertEqual(
+            manifest["videomama"]["identity"]["params"]["guide_source"],
+            mb.SAM2MATTING_BASE_PLUS.backend_id,
+        )
+        self.assertEqual(
+            manifest["videomama_guide"]["backend_id"],
+            mb.SAM2MATTING_BASE_PLUS.backend_id,
+        )
+        guide_dir = Path(manifest["videomama_guide"]["alpha_dir"])
+        self.assertEqual(len(list(guide_dir.glob("*.png"))), 3)
+        self.assertEqual(payload[4]["matte_backend_id"], "videomama")
 
     def test_switching_backends_invalidates_the_cached_frame_records(self):
         state = _build_state(self.root, frame_count=3)

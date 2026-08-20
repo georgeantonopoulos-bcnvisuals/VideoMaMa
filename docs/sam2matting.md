@@ -1,4 +1,4 @@
-# SAM3 (+3.1) tracking with SAM2Matting mattes
+# SAM3 (+3.1), SAM2Matting, and VideoMaMa guide sources
 
 This document covers the matting-backend layer added on top of the existing
 SAM 3 production roto pipeline: what it is, how to bootstrap it, what it was
@@ -42,6 +42,21 @@ Two constraints shaped everything else:
 manifests, resume, output formats) and dispatches the matting pass to one of two
 functions, `_run_videomama_pass` or `_run_sam2matting_pass`, that share a
 `_MatteSink` for overlap cross-fading and writing.
+
+### VideoMaMa guide sources
+
+VideoMaMa has an independent **Guide Source** choice:
+
+- **SAM 3 / SAM 3.1 generated masks** preserves the historical workflow.
+- **SAM2Matting Base+, Tiny, or SAM3 tracker** runs SAM2Matting first as a
+  propagation pre-pass, caches its unthresholded 16-bit alpha, thresholds that
+  alpha into the categorical mask VideoMaMa expects, and then runs VideoMaMa.
+
+This is a real chained pipeline, not merely an A/B between final backends. The
+direct SAM2Matting alpha remains available as its own final backend. The guide
+cache records the SAM2Matting model/checkpoint/runtime, propagation settings,
+SAM prompt identity, fixed ROI, and selected range. VideoMaMa's final identity
+also records the guide cache hash and threshold, so results cannot cross-reuse.
 
 ### Process isolation
 
@@ -152,9 +167,11 @@ SAM2MATTING_GIT_REF=<sha> REFRESH_SAM2MATTING_LOCK=1 bash scripts/bootstrap_sam2
 # then update SAM2MATTING_PINNED_COMMIT in demo/matting_backends.py
 ```
 
-In the UI: pick **Tracking Model** (`sam3` / `sam3.1`), pick **Matting Backend**,
-set the **Matte ROI** mode, prompt keyframes, *Generate SAM 3 Masks*, then
-*Generate Matte (Selected Range)*. Ranges and resume work exactly as before.
+In the UI: pick **Tracking Model** (`sam3` / `sam3.1`), prompt keyframes and
+generate SAM 3 masks. For direct SAM2Matting, use its tab and variant. For
+VideoMaMa, choose **Guide Source** (SAM 3 or a SAM2Matting variant), then use the
+VideoMaMa tab's generation button. **Run & Output** holds the shared range/ROI
+controls plus an explicitly labelled generic backend runner.
 
 ## 3. Exact model and checkpoint variants
 
@@ -252,8 +269,10 @@ opinion on ranges where the tracker struggles. One shot is not a general verdict
 
 ## 5. Comparing SAM2Matting against VideoMaMa on the same frames
 
-Both backends read the same SAM 3 masks and write to their own directories inside
-one run root, so a comparison never overwrites its own baseline.
+For a strict A/B, leave VideoMaMa's Guide Source on SAM 3 so both final backends
+start from the same generated masks. They write to separate directories inside
+one run root, so a comparison never overwrites its own baseline. To test the
+chained pipeline instead, select a SAM2Matting guide source in the VideoMaMa tab.
 
 1. Load the sequence and generate SAM 3 masks once. Every backend reuses them.
 2. Choose a range worth arguing about (a hair or motion-blur heavy handful of
