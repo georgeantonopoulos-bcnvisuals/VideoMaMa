@@ -886,6 +886,23 @@ def _backend_info_markdown(matting_backend):
     return '\n\n'.join(lines)
 
 
+def _select_sam2matting_backend(matting_backend):
+    """Keep the selected SAM2Matting variant, or switch to the production default."""
+    try:
+        spec = mb.resolve_backend(matting_backend)
+    except ValueError:
+        spec = mb.SAM2MATTING_BASE_PLUS
+    if spec.family != 'sam2matting':
+        spec = mb.SAM2MATTING_BASE_PLUS
+    return gr.update(value=spec.label), _backend_info_markdown(spec.label)
+
+
+def _select_videomama_backend():
+    """Select VideoMaMa before its model-specific run button starts inference."""
+    spec = mb.VIDEOMAMA_BACKEND
+    return gr.update(value=spec.label), _backend_info_markdown(spec.label)
+
+
 def apply_quality_preset(quality_preset):
     preset = QUALITY_PRESETS.get(str(quality_preset or 'Balanced'), QUALITY_PRESETS['Balanced'])
     if not preset:
@@ -3638,185 +3655,116 @@ with gr.Blocks(title='VideoMaMa Production Sequence App', css=APP_CSS, js=APP_JS
 
     with gr.Row():
         with gr.Column(scale=4, min_width=360):
-            with gr.Group():
-                sequence_dir = gr.Textbox(label='Sequence Directory', value=_settings['sequence_dir'])
-                with gr.Row():
-                    exr_gamma = gr.Number(label='EXR Gamma', value=_settings['exr_gamma'], precision=2)
-                    exr_exposure = gr.Number(label='EXR Exposure (stops)', value=_settings['exr_exposure'], precision=2)
-                with gr.Accordion('EXR Color Management', open=False):
-                    exr_color_mode = gr.Radio(
-                        list(EXR_COLOR_MODES),
-                        value=_settings['exr_color_mode'],
-                        label='EXR Display Transform',
-                    )
-                    ocio_input_colorspace = gr.Textbox(
-                        label='OCIO Input Colorspace', value=_settings['ocio_input_colorspace']
+            with gr.Tabs():
+                with gr.Tab('1. Load Sequence'):
+                    sequence_dir = gr.Textbox(label='Sequence Directory', value=_settings['sequence_dir'])
+                    with gr.Row():
+                        exr_gamma = gr.Number(label='EXR Gamma', value=_settings['exr_gamma'], precision=2)
+                        exr_exposure = gr.Number(
+                            label='EXR Exposure (stops)', value=_settings['exr_exposure'], precision=2
+                        )
+                    with gr.Accordion('EXR Color Management', open=False):
+                        exr_color_mode = gr.Radio(
+                            list(EXR_COLOR_MODES),
+                            value=_settings['exr_color_mode'],
+                            label='EXR Display Transform',
+                        )
+                        ocio_input_colorspace = gr.Textbox(
+                            label='OCIO Input Colorspace', value=_settings['ocio_input_colorspace']
+                        )
+                        with gr.Row():
+                            ocio_display = gr.Textbox(
+                                label='OCIO Display (blank = default)', value=_settings['ocio_display']
+                            )
+                            ocio_view = gr.Textbox(
+                                label='OCIO View (blank = default)', value=_settings['ocio_view']
+                            )
+                    resume_from_tmp = gr.Checkbox(
+                        label='Resume from tmp', value=_settings['resume_from_tmp']
                     )
                     with gr.Row():
-                        ocio_display = gr.Textbox(label='OCIO Display (blank = default)', value=_settings['ocio_display'])
-                        ocio_view = gr.Textbox(label='OCIO View (blank = default)', value=_settings['ocio_view'])
-                with gr.Row():
-                    resume_from_tmp = gr.Checkbox(label='Resume from tmp', value=_settings['resume_from_tmp'])
-                with gr.Row():
-                    init_btn = gr.Button('Initialize Models', variant='primary')
-                    load_btn = gr.Button('Load Sequence', variant='primary')
-                with gr.Row():
-                    clear_cache_reload_btn = gr.Button('Clear Sequence Cache + Reload')
-                    delete_tmp_btn = gr.Button('Delete Tmp Data', elem_classes=['danger-button'])
+                        init_btn = gr.Button('Initialize Models', variant='primary')
+                        load_btn = gr.Button('Load Sequence', variant='primary')
+                    with gr.Row():
+                        clear_cache_reload_btn = gr.Button('Clear Sequence Cache + Reload')
+                        delete_tmp_btn = gr.Button('Delete Tmp Data', elem_classes=['danger-button'])
 
-                with gr.Accordion('SAM Source ROI Crop (higher detail)', open=False):
-                    sam_crop_enabled = gr.Checkbox(
-                        label='Enable Source ROI Crop',
-                        value=_settings['sam_crop_enabled'],
-                        info='A fixed ROI is cropped from every original frame before scaling to the SAM canvas.',
+                with gr.Tab('2. SAM 3'):
+                    tracking_model = gr.Dropdown(
+                        list(TRACKING_MODELS),
+                        value=_settings['tracking_model'],
+                        label='Tracking Model (SAM 3)',
+                        info=(
+                            'Which SAM 3 weights do the prompting and propagation. '
+                            'Both are gated on Hugging Face and need their own access grant.'
+                        ),
+                    )
+                    processing_resolution = gr.Dropdown(
+                        list(PROCESSING_RESOLUTIONS.keys()),
+                        value=_settings['processing_resolution'],
+                        label='Processing Resolution',
+                        info='Reload the sequence after changing this working resolution.',
+                    )
+                    with gr.Accordion('SAM Source ROI Crop (higher detail)', open=False):
+                        sam_crop_enabled = gr.Checkbox(
+                            label='Enable Source ROI Crop',
+                            value=_settings['sam_crop_enabled'],
+                            info='A fixed ROI is cropped from every original frame before scaling to the SAM canvas.',
+                        )
+                        with gr.Row():
+                            sam_crop_x = gr.Number(label='Crop X', value=_settings['sam_crop_x'], precision=0)
+                            sam_crop_y = gr.Number(label='Crop Y', value=_settings['sam_crop_y'], precision=0)
+                        with gr.Row():
+                            sam_crop_width = gr.Number(
+                                label='Crop Width', value=_settings['sam_crop_width'], precision=0
+                            )
+                            sam_crop_height = gr.Number(
+                                label='Crop Height', value=_settings['sam_crop_height'], precision=0
+                            )
+                        gr.Markdown('Use the viewer’s **SAM Crop** tab to select this ROI visually.')
+                    prompt_mode = gr.Radio(
+                        ['Point keyframes', 'Text concept'],
+                        value=_settings['prompt_mode'],
+                        label='Prompt Mode',
+                    )
+                    concept_prompt = gr.Textbox(label='Concept Prompt', value=_settings['concept_prompt'])
+                    point_mode = gr.Radio(
+                        ['Positive', 'Negative'], value=_settings['point_mode'], label='Point Mode'
                     )
                     with gr.Row():
-                        sam_crop_x = gr.Number(label='Crop X', value=_settings['sam_crop_x'], precision=0)
-                        sam_crop_y = gr.Number(label='Crop Y', value=_settings['sam_crop_y'], precision=0)
+                        undo_btn = gr.Button('Undo Point')
+                        clear_frame_btn = gr.Button('Clear Frame Points')
                     with gr.Row():
-                        sam_crop_width = gr.Number(
-                            label='Crop Width', value=_settings['sam_crop_width'], precision=0
-                        )
-                        sam_crop_height = gr.Number(
-                            label='Crop Height', value=_settings['sam_crop_height'], precision=0
-                        )
+                        clear_all_btn = gr.Button('Clear All Prompts')
+                        preview_text_btn = gr.Button('Preview Text Concept')
+                    sam_output_prob_thresh = gr.Slider(
+                        label='SAM Mask Threshold', minimum=0.1, maximum=0.9,
+                        value=_settings['sam_output_prob_thresh'], step=0.01,
+                    )
+                    sam_refine_edges_against_plate = gr.Checkbox(
+                        label='Smooth/Snap SAM Boundary (avoid for hair)',
+                        value=_settings['sam_refine_edges_against_plate'],
+                        info='Constrained GrabCut can remove thin hair and flyaways. Hair Detail disables it.',
+                    )
+                    with gr.Row():
+                        refresh_sam_preview_btn = gr.Button('Refresh SAM Preview')
+                        gen_masks_btn = gr.Button('Generate SAM 3 Masks', variant='primary')
+                    keyframes_info = gr.Textbox(label='Prompt Summary', interactive=False)
+
+                with gr.Tab('3. SAM2Matting'):
                     gr.Markdown(
-                        'Use the **SAM Crop** tab to load a full-resolution frame and select the ROI visually.'
+                        'SAM2Matting consumes the generated **SAM 3 masks** and produces the soft alpha matte.'
                     )
-
-            with gr.Group():
-                prompt_mode = gr.Radio(
-                    ['Point keyframes', 'Text concept'],
-                    value=_settings['prompt_mode'],
-                    label='Prompt Mode',
-                )
-                concept_prompt = gr.Textbox(label='Concept Prompt', value=_settings['concept_prompt'])
-                point_mode = gr.Radio(['Positive', 'Negative'], value=_settings['point_mode'], label='Point Mode')
-                with gr.Row():
-                    undo_btn = gr.Button('Undo Point')
-                    clear_frame_btn = gr.Button('Clear Frame Points')
-                with gr.Row():
-                    clear_all_btn = gr.Button('Clear All Prompts')
-                    preview_text_btn = gr.Button('Preview Text Concept')
-                refresh_sam_preview_btn = gr.Button('Refresh SAM Preview', variant='primary')
-                gen_masks_btn = gr.Button('Generate SAM 3 Masks', variant='primary')
-                keyframes_info = gr.Textbox(label='Prompt Summary', interactive=False)
-
-            with gr.Group():
-                quality_preset = gr.Radio(
-                    ['Balanced', 'Fine Detail', 'Hair Detail', 'Tight Matte', 'Maximum Detail', 'Custom'],
-                    value=_settings['quality_preset'],
-                    label='Combined SAM 3 + VideoMaMa Quality Preset',
-                    info=(
-                        'Hair Detail preserves SAM flyaways, runs at 2048x1152, and gives VideoMaMa '
-                        'a small context margin. Reload the sequence after changing preset resolution. '
-                        'Presets tune SAM 3 and VideoMaMa only; SAM2Matting has its own settings below.'
-                    ),
-                )
-                gr.Markdown(
-                    '**Hair workflow:** SAM supplies a binary guide; VideoMaMa creates the soft alpha. '
-                    'Hair Detail keeps SAM’s irregular boundary instead of smoothing it away.'
-                )
-                sam_output_prob_thresh = gr.Slider(
-                    label='SAM Mask Threshold',
-                    minimum=0.1,
-                    maximum=0.9,
-                    value=_settings['sam_output_prob_thresh'],
-                    step=0.01,
-                )
-                sam_refine_edges_against_plate = gr.Checkbox(
-                    label='Smooth/Snap SAM Boundary (avoid for hair)',
-                    value=_settings['sam_refine_edges_against_plate'],
-                    info='Constrained GrabCut can remove thin hair and flyaways. Hair Detail disables it.',
-                )
-                videomama_mask_cond_mode = gr.Radio(
-                    ['vae', 'interpolate'],
-                    value=_settings['videomama_mask_cond_mode'],
-                    label='VideoMaMa Mask Guide',
-                )
-                processing_resolution = gr.Dropdown(
-                    list(PROCESSING_RESOLUTIONS.keys()),
-                    value=_settings['processing_resolution'],
-                    label='Processing Resolution',
-                )
-                videomama_guide_expand_px = gr.Slider(
-                    label='VideoMaMa Hair Guide Margin (source px)',
-                    minimum=0,
-                    maximum=32,
-                    value=_settings['videomama_guide_expand_px'],
-                    step=1,
-                    info=(
-                        'Expands only VideoMaMa’s conditioning guide to include nearby wisps; '
-                        'saved SAM masks stay unchanged.'
-                    ),
-                )
-                refine_edges_against_plate = gr.Checkbox(
-                    label='Smooth Final Alpha Against Plate (avoid for hair)',
-                    value=_settings['refine_edges_against_plate'],
-                    info='The guided smoothing pass can simplify fine hair. Hair Detail disables it.',
-                )
-                free_gpu_after_run = gr.Checkbox(
-                    label='Free GPU After Run',
-                    value=_settings['free_gpu_after_run'],
-                )
-                with gr.Row():
-                    videomama_seed = gr.Number(label='VideoMaMa Seed', value=_settings['videomama_seed'], precision=0)
-                    videomama_fps = gr.Number(label='VideoMaMa FPS', value=_settings['videomama_fps'], precision=0)
-                with gr.Row():
-                    videomama_motion_bucket_id = gr.Number(
-                        label='VideoMaMa Motion Bucket',
-                        value=_settings['videomama_motion_bucket_id'],
-                        precision=0,
+                    matting_backend = gr.Dropdown(
+                        mb.backend_labels(),
+                        value=_settings['matting_backend'],
+                        label='Matting Backend / SAM2Matting Variant',
+                        info=(
+                            'Choose a SAM2Matting variant here. The model-specific button below keeps '
+                            'that variant, or selects Base+ if VideoMaMa is currently selected.'
+                        ),
                     )
-                    videomama_noise_aug_strength = gr.Number(
-                        label='VideoMaMa Noise',
-                        value=_settings['videomama_noise_aug_strength'],
-                        precision=3,
-                    )
-
-            with gr.Group():
-                tracking_model = gr.Dropdown(
-                    list(TRACKING_MODELS),
-                    value=_settings['tracking_model'],
-                    label='Tracking Model (SAM 3)',
-                    info=(
-                        'Which SAM 3 weights do the prompting and propagation. '
-                        'Both are gated on Hugging Face and need their own access grant.'
-                    ),
-                )
-                matting_backend = gr.Dropdown(
-                    mb.backend_labels(),
-                    value=_settings['matting_backend'],
-                    label='Matting Backend',
-                    info=(
-                        'SAM 3 always does tracking. This chooses what turns the tracked '
-                        'mask into alpha. SAM2Matting runs in its own isolated process.'
-                    ),
-                )
-                backend_info = gr.Markdown(_backend_info_markdown(_settings['matting_backend']))
-                matte_roi_mode = gr.Radio(
-                    list(MATTE_ROI_MODES),
-                    value=_settings['matte_roi_mode'],
-                    label='Matte ROI',
-                    info=(
-                        'Auto derives one fixed source-space ROI from the generated SAM 3 '
-                        'masks. An enabled manual SAM ROI crop always overrides it.'
-                    ),
-                )
-                with gr.Row():
-                    matte_roi_padding = gr.Slider(
-                        label='Matte ROI Padding',
-                        minimum=0.0, maximum=0.6, step=0.01,
-                        value=_settings['matte_roi_padding'],
-                        info='Margin as a fraction of the subject box; hair lives outside the mask.',
-                    )
-                    matte_roi_min_gain = gr.Slider(
-                        label='Matte ROI Minimum Gain',
-                        minimum=1.0, maximum=4.0, step=0.05,
-                        value=_settings['matte_roi_min_gain'],
-                        info='Below this area saving, the ROI is dropped and the full frame is used.',
-                    )
-                with gr.Accordion('SAM2Matting Settings', open=True):
+                    backend_info = gr.Markdown(_backend_info_markdown(_settings['matting_backend']))
                     s2m_conditioning = gr.Dropdown(
                         list(mb.CONDITIONING_STRATEGIES.keys()),
                         value=_settings['s2m_conditioning'],
@@ -3828,13 +3776,11 @@ with gr.Blocks(title='VideoMaMa Production Sequence App', css=APP_CSS, js=APP_JS
                     )
                     with gr.Row():
                         s2m_guidance_interval = gr.Slider(
-                            label='Guidance Interval (frames)',
-                            minimum=1, maximum=96, step=1,
+                            label='Guidance Interval (frames)', minimum=1, maximum=96, step=1,
                             value=_settings['s2m_guidance_interval'],
                         )
                         s2m_frame_cap = gr.Slider(
-                            label='Frame Cap (long edge px)',
-                            minimum=512, maximum=4096, step=64,
+                            label='Frame Cap (long edge px)', minimum=512, maximum=4096, step=64,
                             value=_settings['s2m_frame_cap'],
                             info='ROI frames are staged at this cap. Inference is 1024px square regardless.',
                         )
@@ -3844,61 +3790,132 @@ with gr.Blocks(title='VideoMaMa Production Sequence App', css=APP_CSS, js=APP_JS
                             value=_settings['s2m_window_size'], precision=0,
                         )
                         s2m_window_overlap = gr.Number(
-                            label='Window Overlap',
-                            value=_settings['s2m_window_overlap'], precision=0,
+                            label='Window Overlap', value=_settings['s2m_window_overlap'], precision=0,
                         )
                     with gr.Row():
                         s2m_offload = gr.Checkbox(
-                            label='CPU Offload (video + state)',
-                            value=_settings['s2m_offload'],
+                            label='CPU Offload (video + state)', value=_settings['s2m_offload'],
                             info='Keep enabled on a 24 GB L4; costs some speed, avoids OOM.',
                         )
-                        s2m_bf16 = gr.Checkbox(
-                            label='BF16 Inference', value=_settings['s2m_bf16'],
-                        )
+                        s2m_bf16 = gr.Checkbox(label='BF16 Inference', value=_settings['s2m_bf16'])
                     gr.Markdown(
-                        'SAM2Matting predicts soft boundaries itself, so the GrabCut / guided-filter '
-                        'refinements above are **not** applied to its output.'
+                        'SAM2Matting predicts soft boundaries itself, so VideoMaMa’s GrabCut and '
+                        'guided-filter refinements are not applied.'
                     )
-                matte_qc_enabled = gr.Checkbox(
-                    label='Run Matte QC',
-                    value=_settings['matte_qc_enabled'],
-                    info='Compares each alpha against its SAM 3 mask and lists suspicious ranges.',
-                )
+                    generate_sam2matting_btn = gr.Button(
+                        'Generate SAM2Matting Matte from SAM 3 Masks', variant='primary'
+                    )
 
-            with gr.Group():
-                with gr.Row():
-                    chunk_size = gr.Number(label='Chunk Size', value=_settings['chunk_size'], precision=0)
-                    overlap = gr.Number(label='Overlap', value=_settings['overlap'], precision=0)
-                with gr.Row():
-                    range_start = gr.Number(label='Start Frame', value=_settings['range_start'], precision=0)
-                    range_end = gr.Number(label='End Frame (-1 = last)', value=_settings['range_end'], precision=0)
-                custom_output_dir = gr.Textbox(
-                    label='Custom Output Directory',
-                    value=_settings['custom_output_dir'],
-                )
-                alpha_output_format = gr.Dropdown(
-                    list(ALPHA_OUTPUT_FORMATS),
-                    value=_settings['alpha_output_format'],
-                    label='Alpha Output Format',
-                )
-                run_btn = gr.Button('Generate Matte (Selected Range)', variant='primary')
-                unload_models_btn = gr.Button('Unload Models / Free GPU')
-                mask_dir = gr.Textbox(label='Mask Directory', interactive=False)
-                output_dir = gr.Textbox(label='Matte Output Directory', interactive=False)
+                with gr.Tab('4. VideoMaMa'):
+                    quality_preset = gr.Radio(
+                        ['Balanced', 'Fine Detail', 'Hair Detail', 'Tight Matte', 'Maximum Detail', 'Custom'],
+                        value=_settings['quality_preset'],
+                        label='Combined SAM 3 + VideoMaMa Quality Preset',
+                        info=(
+                            'Presets tune SAM 3 and VideoMaMa only. Reload after a preset changes '
+                            'the processing resolution.'
+                        ),
+                    )
+                    gr.Markdown(
+                        '**Hair workflow:** SAM supplies a binary guide; VideoMaMa creates the soft alpha.'
+                    )
+                    videomama_mask_cond_mode = gr.Radio(
+                        ['vae', 'interpolate'], value=_settings['videomama_mask_cond_mode'],
+                        label='VideoMaMa Mask Guide',
+                    )
+                    videomama_guide_expand_px = gr.Slider(
+                        label='VideoMaMa Hair Guide Margin (source px)', minimum=0, maximum=32,
+                        value=_settings['videomama_guide_expand_px'], step=1,
+                        info='Expands only VideoMaMa’s guide; saved SAM masks stay unchanged.',
+                    )
+                    refine_edges_against_plate = gr.Checkbox(
+                        label='Smooth Final Alpha Against Plate (avoid for hair)',
+                        value=_settings['refine_edges_against_plate'],
+                        info='The guided smoothing pass can simplify fine hair. Hair Detail disables it.',
+                    )
+                    with gr.Row():
+                        videomama_seed = gr.Number(
+                            label='VideoMaMa Seed', value=_settings['videomama_seed'], precision=0
+                        )
+                        videomama_fps = gr.Number(
+                            label='VideoMaMa FPS', value=_settings['videomama_fps'], precision=0
+                        )
+                    with gr.Row():
+                        videomama_motion_bucket_id = gr.Number(
+                            label='VideoMaMa Motion Bucket',
+                            value=_settings['videomama_motion_bucket_id'], precision=0,
+                        )
+                        videomama_noise_aug_strength = gr.Number(
+                            label='VideoMaMa Noise',
+                            value=_settings['videomama_noise_aug_strength'], precision=3,
+                        )
+                    with gr.Row():
+                        chunk_size = gr.Number(
+                            label='VideoMaMa Chunk Size', value=_settings['chunk_size'], precision=0
+                        )
+                        overlap = gr.Number(
+                            label='VideoMaMa Overlap', value=_settings['overlap'], precision=0
+                        )
+                    generate_videomama_btn = gr.Button(
+                        'Generate VideoMaMa Matte (Selected Range)', variant='primary'
+                    )
 
-            with gr.Accordion('Debug Console', open=False):
-                debug_console = gr.Textbox(
-                    label='Console',
-                    value=_debug_console_text(),
-                    lines=18,
-                    max_lines=28,
-                    interactive=False,
-                    elem_classes=['debug-console'],
-                )
-                with gr.Row():
-                    refresh_debug_btn = gr.Button('Refresh Console')
-                    clear_debug_btn = gr.Button('Clear Console')
+                with gr.Tab('5. Run & Output'):
+                    gr.Markdown(
+                        'These range, ROI, output, and GPU controls are shared by both matting backends.'
+                    )
+                    with gr.Row():
+                        range_start = gr.Number(
+                            label='Start Frame', value=_settings['range_start'], precision=0
+                        )
+                        range_end = gr.Number(
+                            label='End Frame (-1 = last)', value=_settings['range_end'], precision=0
+                        )
+                    matte_roi_mode = gr.Radio(
+                        list(MATTE_ROI_MODES), value=_settings['matte_roi_mode'], label='Matte ROI',
+                        info=(
+                            'Auto derives one fixed source-space ROI from the generated SAM 3 masks. '
+                            'An enabled manual SAM ROI crop always overrides it.'
+                        ),
+                    )
+                    with gr.Row():
+                        matte_roi_padding = gr.Slider(
+                            label='Matte ROI Padding', minimum=0.0, maximum=0.6, step=0.01,
+                            value=_settings['matte_roi_padding'],
+                            info='Margin as a fraction of the subject box; hair lives outside the mask.',
+                        )
+                        matte_roi_min_gain = gr.Slider(
+                            label='Matte ROI Minimum Gain', minimum=1.0, maximum=4.0, step=0.05,
+                            value=_settings['matte_roi_min_gain'],
+                            info='Below this area saving, the full frame is used.',
+                        )
+                    custom_output_dir = gr.Textbox(
+                        label='Custom Output Directory', value=_settings['custom_output_dir']
+                    )
+                    alpha_output_format = gr.Dropdown(
+                        list(ALPHA_OUTPUT_FORMATS), value=_settings['alpha_output_format'],
+                        label='Alpha Output Format',
+                    )
+                    matte_qc_enabled = gr.Checkbox(
+                        label='Run Matte QC', value=_settings['matte_qc_enabled'],
+                        info='Compares each alpha against its SAM 3 mask and lists suspicious ranges.',
+                    )
+                    free_gpu_after_run = gr.Checkbox(
+                        label='Free GPU After Run', value=_settings['free_gpu_after_run']
+                    )
+                    run_btn = gr.Button('Generate Matte (Selected Range)', variant='primary')
+                    unload_models_btn = gr.Button('Unload Models / Free GPU')
+                    mask_dir = gr.Textbox(label='Mask Directory', interactive=False)
+                    output_dir = gr.Textbox(label='Matte Output Directory', interactive=False)
+
+                with gr.Tab('6. Debug'):
+                    debug_console = gr.Textbox(
+                        label='Console', value=_debug_console_text(), lines=18, max_lines=28,
+                        interactive=False, elem_classes=['debug-console'],
+                    )
+                    with gr.Row():
+                        refresh_debug_btn = gr.Button('Refresh Console')
+                        clear_debug_btn = gr.Button('Clear Console')
 
         with gr.Column(scale=7, min_width=560):
             frame_slider = gr.Slider(label='Current Frame', minimum=0, maximum=0, value=0, step=1, interactive=False)
@@ -4205,25 +4222,34 @@ with gr.Blocks(title='VideoMaMa Production Sequence App', css=APP_CSS, js=APP_JS
         ],
         outputs=ui_outputs,
     )
-    run_btn.click(
-        run_sequence,
-        inputs=[
-            state, chunk_size, overlap, range_start, range_end, custom_output_dir,
-            prompt_mode, concept_prompt, sam_output_prob_thresh,
-            videomama_mask_cond_mode, videomama_seed, videomama_fps,
-            videomama_motion_bucket_id, videomama_noise_aug_strength,
-            videomama_guide_expand_px,
-            processing_resolution,
-            sam_crop_enabled, sam_crop_x, sam_crop_y, sam_crop_width, sam_crop_height,
-            refine_edges_against_plate, free_gpu_after_run,
-            alpha_output_format,
-            matting_backend, matte_roi_mode, matte_roi_padding, matte_roi_min_gain,
-            s2m_conditioning, s2m_guidance_interval, s2m_frame_cap,
-            s2m_window_size, s2m_window_overlap, s2m_offload, s2m_bf16,
-            matte_qc_enabled,
-        ],
-        outputs=ui_outputs,
-    )
+    matte_run_inputs = [
+        state, chunk_size, overlap, range_start, range_end, custom_output_dir,
+        prompt_mode, concept_prompt, sam_output_prob_thresh,
+        videomama_mask_cond_mode, videomama_seed, videomama_fps,
+        videomama_motion_bucket_id, videomama_noise_aug_strength,
+        videomama_guide_expand_px,
+        processing_resolution,
+        sam_crop_enabled, sam_crop_x, sam_crop_y, sam_crop_width, sam_crop_height,
+        refine_edges_against_plate, free_gpu_after_run,
+        alpha_output_format,
+        matting_backend, matte_roi_mode, matte_roi_padding, matte_roi_min_gain,
+        s2m_conditioning, s2m_guidance_interval, s2m_frame_cap,
+        s2m_window_size, s2m_window_overlap, s2m_offload, s2m_bf16,
+        matte_qc_enabled,
+    ]
+    run_btn.click(run_sequence, inputs=matte_run_inputs, outputs=ui_outputs)
+    generate_sam2matting_btn.click(
+        _select_sam2matting_backend,
+        inputs=matting_backend,
+        outputs=[matting_backend, backend_info],
+        queue=False,
+    ).then(run_sequence, inputs=matte_run_inputs, outputs=ui_outputs)
+    generate_videomama_btn.click(
+        _select_videomama_backend,
+        inputs=None,
+        outputs=[matting_backend, backend_info],
+        queue=False,
+    ).then(run_sequence, inputs=matte_run_inputs, outputs=ui_outputs)
     tracking_model.change(
         set_tracking_model,
         inputs=tracking_model,

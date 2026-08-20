@@ -147,6 +147,33 @@ class ClearSequenceCacheTests(unittest.TestCase):
 
 
 class ProductionUtilityTests(unittest.TestCase):
+    def test_model_specific_run_buttons_select_the_expected_backend(self):
+        backend_update, backend_info = app._select_sam2matting_backend(
+            app.mb.VIDEOMAMA_BACKEND.label
+        )
+        self.assertEqual(backend_update['value'], app.mb.SAM2MATTING_BASE_PLUS.label)
+        self.assertIn(app.mb.SAM2MATTING_BASE_PLUS.label, backend_info)
+
+        backend_update, backend_info = app._select_sam2matting_backend(
+            app.mb.SAM2MATTING_TINY.label
+        )
+        self.assertEqual(backend_update['value'], app.mb.SAM2MATTING_TINY.label)
+        self.assertIn(app.mb.SAM2MATTING_TINY.label, backend_info)
+
+        backend_update, backend_info = app._select_videomama_backend()
+        self.assertEqual(backend_update['value'], app.mb.VIDEOMAMA_BACKEND.label)
+        self.assertIn(app.mb.VIDEOMAMA_BACKEND.label, backend_info)
+
+    def test_model_specific_run_buttons_are_exposed(self):
+        self.assertEqual(
+            app.generate_sam2matting_btn.value,
+            'Generate SAM2Matting Matte from SAM 3 Masks',
+        )
+        self.assertEqual(
+            app.generate_videomama_btn.value,
+            'Generate VideoMaMa Matte (Selected Range)',
+        )
+
     def test_sam_preview_controls_are_bounded(self):
         self.assertEqual(app._sam_preview_height(100), 360)
         self.assertEqual(app._sam_preview_height(2000), 1200)
