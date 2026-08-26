@@ -7,7 +7,7 @@
 # - builds local libffi and bzip2 so Python 3.12 has ctypes and bz2 even when
 #   system *-devel RPMs are unavailable
 # - builds the SAM 3 UI venv through bootstrap_tmp_venv.sh
-# - optionally authenticates Hugging Face when HF_TOKEN is provided
+# - reuses the shared project Hugging Face token, or HF_TOKEN when provided
 # - launches the Gradio UI
 #
 # Usage:
@@ -32,6 +32,11 @@ if [[ -z "${SCRIPT_DIR}" ]]; then
 fi
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${REPO_ROOT}"
+
+# Reuse the project-scoped credential from the shared checkout. This does not
+# share Hugging Face caches or put the token itself in the environment file.
+export VIDEOMAMA_HF_TOKEN_FILE="${VIDEOMAMA_HF_TOKEN_FILE:-${REPO_ROOT}/.videomama-secrets/huggingface.token}"
+export HF_TOKEN_PATH="${HF_TOKEN_PATH:-${VIDEOMAMA_HF_TOKEN_FILE}}"
 
 if [[ -n "${SUDO_USER:-}" ]]; then
   echo "Do not run this script with sudo. It installs user-local pyenv/deps and /tmp venvs." >&2

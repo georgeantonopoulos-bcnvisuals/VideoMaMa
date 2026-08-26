@@ -61,6 +61,8 @@ Important environment variables are written to `.videomama-env`:
 - `VIDEOMAMA_VENV_ROOT`
 - `VIDEOMAMA_VENV`
 - `VIDEOMAMA_UI_VENV`
+- `VIDEOMAMA_HF_TOKEN_FILE`
+- `HF_TOKEN_PATH`
 - `VIDEOMAMA_BASE_MODEL_PATH`
 - `VIDEOMAMA_UNET_CHECKPOINT_PATH`
 - `VIDEOMAMA_SAM2MATTING_VENV`
@@ -110,10 +112,17 @@ pyenv-installed 3.12 under `~/.pyenv`. Override with `PYTHON_UI_BIN=/path/to/pyt
 when needed. The launch script activates the built UI venv; it does not create
 the venv itself.
 
-SAM 3 checkpoints are gated on Hugging Face. The UI venv must be authenticated
-with `$VIDEOMAMA_UI_VENV/bin/hf auth login`, and the token must have
-accepted access to `facebook/sam3` or `facebook/sam3.1`. Override the default
-with `SAM3_MODEL_VERSION=sam3.1` when launching.
+SAM 3 checkpoints are gated on Hugging Face. Studio machines reuse the token at
+`.videomama-secrets/huggingface.token` through `HF_TOKEN_PATH`; the directory is
+Git-ignored and protected by a server-side CIFS DACL. All authenticated studio
+users have read-only access; the owning domain user, system, and storage admins
+retain full access. This mount reports synthetic `755` POSIX modes, so `chmod`
+is not the security boundary. The token must have accepted access to
+`facebook/sam3` or `facebook/sam3.1`. To replace it, source `.videomama-env` and
+run `$VIDEOMAMA_UI_VENV/bin/hf auth login`; new files inherit the restricted
+DACL. Do not commit or paste the token into scripts. `HF_TOKEN`, `HF_TOKEN_PATH`,
+and `VIDEOMAMA_HF_TOKEN_FILE` remain explicit overrides. Override the model
+default with `SAM3_MODEL_VERSION=sam3.1` when launching.
 
 The first SAM 3 Git commit resolved by the bootstrap is recorded in
 `tmp/runtime-locks/sam3-requirement.txt` and reused for later venv

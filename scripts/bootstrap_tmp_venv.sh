@@ -58,6 +58,7 @@ fi
 
 REPO_ROOT="$(cd .. && pwd)"
 ENV_FILE="${REPO_ROOT}/.videomama-env"
+HF_TOKEN_FILE="${VIDEOMAMA_HF_TOKEN_FILE:-${REPO_ROOT}/.videomama-secrets/huggingface.token}"
 
 DEFAULT_CHECKPOINTS="/mnt/production/project/bcn_lib/work/AI/VideoMaMa/checkpoints"
 CHECKPOINTS_DIR="${VIDEOMAMA_CHECKPOINTS:-${DEFAULT_CHECKPOINTS}}"
@@ -233,6 +234,10 @@ export VIDEOMAMA_VENV_ROOT="${VENV_ROOT}"
 export VIDEOMAMA_VENV="${INFER_VENV}"
 export VIDEOMAMA_UI_VENV="${UI_VENV}"
 export VIDEOMAMA_UI_PYTHON="${PYTHON_UI_BIN}"
+export VIDEOMAMA_HF_TOKEN_FILE="${HF_TOKEN_FILE}"
+# Share only the credential file. Hugging Face model caches remain local to
+# each machine, and an explicitly supplied HF_TOKEN_PATH still takes priority.
+export HF_TOKEN_PATH="\${HF_TOKEN_PATH:-\${VIDEOMAMA_HF_TOKEN_FILE}}"
 export VIDEOMAMA_SAM2MATTING_VENV="${S2M_VENV}"
 export VIDEOMAMA_SAM2MATTING_HOME="${S2M_HOME}"
 export VIDEOMAMA_BASE_MODEL_PATH="\${VIDEOMAMA_BASE_MODEL_PATH:-${CHECKPOINTS_DIR}/stable-video-diffusion-img2vid-xt}"

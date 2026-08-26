@@ -17,6 +17,11 @@ if [[ -f "${ENV_FILE}" ]]; then
   source "${ENV_FILE}"
 fi
 
+# The token file lives with this shared checkout, while caches and venvs stay
+# machine-local. HF_TOKEN and an explicit HF_TOKEN_PATH both override it.
+export VIDEOMAMA_HF_TOKEN_FILE="${VIDEOMAMA_HF_TOKEN_FILE:-${REPO_ROOT}/.videomama-secrets/huggingface.token}"
+export HF_TOKEN_PATH="${HF_TOKEN_PATH:-${VIDEOMAMA_HF_TOKEN_FILE}}"
+
 VENV_ROOT="${VIDEOMAMA_VENV_ROOT:-/mnt/temporal/VideoMama}"
 UI_VENV="${VIDEOMAMA_UI_VENV:-${VENV_ROOT}/videomama-sam3-ui-venv}"
 

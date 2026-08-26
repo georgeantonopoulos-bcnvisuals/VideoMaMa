@@ -56,6 +56,15 @@ source .videomama-env
 bash scripts/run_production_frame_ui.sh
 ```
 
+SAM 3 uses the Git-ignored shared token at
+`.videomama-secrets/huggingface.token`. The generated `.videomama-env` exposes
+its path through `HF_TOKEN_PATH`, so the same checkout works from each studio
+machine without sharing the machine-local Hugging Face cache. The token file
+is protected by the shared filesystem's server DACL: authenticated studio users
+can read it, while only the owner and storage administrators can modify it. The
+mount's displayed POSIX modes are synthetic. Use an explicit `HF_TOKEN` or
+`HF_TOKEN_PATH` to override it.
+
 See `AGENTS.md` and `inference.md` for the production runtime layout and
 checkpoint environment variables.
 
