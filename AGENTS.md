@@ -261,7 +261,9 @@ VideoMaMa preview PNGs remain 8-bit for the UI; `alpha_frames` supports 16-bit
 PNG, half-float EXR, or both. EXR model-input conversion supports gamma and
 exposure controls.
 
-The production app supports `.exr`, `.png`, `.jpg`, `.jpeg`, `.tif`, and `.tiff` inputs. EXR RGB conversion uses `OpenEXR`/`Imath`, `exr_gamma`, and exposure handling in code.
+Model canvases are sized by `demo/model_canvas.py`, not by a fixed 16:9 resolution. The canvas always carries the region's aspect (the old path stretched it, up to 3.5x on a portrait ROI), never upscales past the region, and is bounded by free VRAM (affine fit), a quality ceiling, and a hard CUDA grid limit of 4,194,240 px (65535 latent tokens; exceeding it kills the CUDA context irrecoverably). Re-measure the constants with `scripts/calibrate_resolution.py`. `Matte ROI` defaults to Full frame.
+
+The production app supports `.exr`, `.png`, `.jpg`, `.jpeg`, `.tif`, and `.tiff` inputs. EXR RGB conversion uses `OpenEXR`/`Imath` plus exposure handling in code. EXRs default to ACES scene-linear (`scene_linear` -> ACEScg) displayed through the ACES `sRGB` view; `VIDEOMAMA_OCIO_CONFIG` overrides the config, and `Gamma / Exposure` with `exr_gamma` is the legacy raw-linear path. Do not rely on `$OCIO` — OpenColorIO answers with a passthrough "color management disabled" config when it is unset.
 
 ### Session Persistence And Resume
 

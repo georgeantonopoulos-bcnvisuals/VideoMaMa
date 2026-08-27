@@ -1,3 +1,4 @@
+import os
 import sys
 import tempfile
 import unittest
@@ -205,7 +206,10 @@ class ProductionUtilityTests(unittest.TestCase):
         self.assertEqual(len(updates), 9)
         self.assertEqual(updates[0]['value'], 0.35)
         self.assertEqual(updates[1]['value'], 'vae')
-        self.assertEqual(updates[5]['value'], '2048x1152 (experimental)')
+        # These two presets now select Auto rather than pinning a fixed 16:9
+        # canvas: picking a max-quality preset must not drop the artist off
+        # aspect-matched, VRAM-aware sizing back onto a stretched canvas.
+        self.assertEqual(updates[5]['value'], app.AUTO_PROCESSING_RESOLUTION)
         self.assertTrue(updates[6]['value'])
         self.assertEqual(updates[7]['value'], 0)
         self.assertTrue(updates[8]['value'])
@@ -219,7 +223,10 @@ class ProductionUtilityTests(unittest.TestCase):
 
         self.assertEqual(len(updates), 9)
         self.assertEqual(updates[0]['value'], 0.2)
-        self.assertEqual(updates[5]['value'], '2048x1152 (experimental)')
+        # These two presets now select Auto rather than pinning a fixed 16:9
+        # canvas: picking a max-quality preset must not drop the artist off
+        # aspect-matched, VRAM-aware sizing back onto a stretched canvas.
+        self.assertEqual(updates[5]['value'], app.AUTO_PROCESSING_RESOLUTION)
         self.assertFalse(updates[6]['value'])
         self.assertEqual(updates[7]['value'], 8)
         self.assertFalse(updates[8]['value'])
@@ -411,15 +418,77 @@ class ProductionUtilityTests(unittest.TestCase):
         np.testing.assert_allclose(first, 1.0 / 3.0)
         np.testing.assert_allclose(second, 2.0 / 3.0)
 
-    def test_ocio_packed_image_transform_path(self):
-        image = np.array([[[0.1, 0.5, 1.0], [0.25, 0.75, 0.0]]], dtype=np.float32)
-        transformed = app._apply_ocio_display(
-            image,
-            input_colorspace="raw",
-            display="sRGB",
-            view="Raw",
-        )
-        np.testing.assert_allclose(transformed, image, atol=1e-6)
+    def test_viewer_defaults_read_exrs_as_aces_scene_linear(self):
+        self.assertEqual(app.DEFAULT_EXR_COLOR_MODE, "OCIO Display")
+        self.assertEqual(app.DEFAULT_OCIO_INPUT_COLORSPACE, "scene_linear")
+        self.assertEqual(app.DEFAULT_SETTINGS["exr_color_mode"], "OCIO Display")
+        self.assertEqual(app.DEFAULT_SETTINGS["ocio_input_colorspace"], "scene_linear")
+
+    def test_scene_linear_resolves_to_an_aces_colorspace(self):
+        config, source = app._resolve_ocio_config("scene_linear")
+        resolved = config.getColorSpace("scene_linear")
+        self.assertIsNotNone(resolved, f"scene_linear unresolved in config from {source}")
+        self.assertIn("ACEScg", resolved.getName())
+
+    def test_ocio_display_applies_the_aces_view_transform(self):
+        # 0.18 scene-linear grey lands at ~0.3565 through the ACES sRGB output
+        # transform. A passthrough config would leave it at 0.18, so this is the
+        # assertion that fails if OCIO silently degrades to "color management
+        # disabled" the way it did when $OCIO was unset.
+        grey = np.full((1, 1, 3), 0.18, dtype=np.float32)
+        transformed = app._apply_ocio_display(grey)
+        np.testing.assert_allclose(transformed, 0.3565, atol=2e-3)
+
+    def test_ocio_resolver_rejects_a_config_without_the_input_colorspace(self):
+        with self.assertRaises(RuntimeError) as caught:
+            app._resolve_ocio_config("definitely_not_a_colorspace")
+        self.assertIn("definitely_not_a_colorspace", str(caught.exception))
+
+    def test_ocio_resolver_falls_back_to_the_builtin_aces_config(self):
+        # Machines without the production mount must still get ACES, not raw.
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("VIDEOMAMA_OCIO_CONFIG", None)
+            os.environ.pop("OCIO", None)
+            with mock.patch.object(app, "ACES_OCIO_CONFIG_CANDIDATES", ("/nonexistent/config.ocio",)), \
+                    mock.patch.dict(app._OCIO_CONFIG_CACHE, {}, clear=True):
+                config, source = app._resolve_ocio_config("scene_linear")
+        self.assertEqual(source, app.ACES_OCIO_BUILTIN_CONFIG)
+        self.assertIsNotNone(config.getColorSpace("scene_linear"))
+
+    def test_exr_read_uses_aces_and_rolls_off_highlights(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "plate.exr"
+            header = app.OpenEXR.Header(3, 1)
+            float_channel = app.Imath.Channel(app.Imath.PixelType(app.Imath.PixelType.FLOAT))
+            header["channels"] = {name: float_channel for name in ("R", "G", "B")}
+            values = np.array([0.18, 1.0, 4.0], dtype=np.float32)
+            output = app.OpenEXR.OutputFile(str(path), header)
+            output.writePixels({name: values.tobytes() for name in ("R", "G", "B")})
+            output.close()
+
+            aces = app._read_exr_rgb(str(path))[0, :, 0]
+            legacy = app._read_exr_rgb(
+                str(path), exr_gamma=1.0, exr_color_mode="Gamma / Exposure"
+            )[0, :, 0]
+
+        # Mid grey is lifted by the tone curve rather than passed through.
+        self.assertEqual(int(aces[0]), 91)
+        # The legacy raw-linear path clips everything at and above 1.0 to white;
+        # the ACES view keeps 1.0 and 4.0 distinguishable.
+        self.assertEqual(list(legacy[1:]), [255, 255])
+        self.assertLess(int(aces[1]), int(aces[2]))
+        self.assertLess(int(aces[2]), 255)
+
+    def test_legacy_color_settings_do_not_match_the_aces_defaults(self):
+        # Otherwise a pre-ACES run cache would be reused with the old colour
+        # baked into its JPEGs instead of being rebuilt.
+        current = {
+            "mode": app.DEFAULT_EXR_COLOR_MODE,
+            "input_colorspace": app.DEFAULT_OCIO_INPUT_COLORSPACE,
+            "display": app.DEFAULT_OCIO_DISPLAY,
+            "view": app.DEFAULT_OCIO_VIEW,
+        }
+        self.assertNotEqual(dict(app.LEGACY_EXR_COLOR_SETTINGS), current)
 
     def test_exr_exposure_and_gamma_conversion(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -778,6 +847,152 @@ class WrapperContractTests(unittest.TestCase):
             manifest = app._read_run_manifest(root / "run")["videomama"]
             self.assertEqual(manifest["status"], "complete")
             self.assertEqual(manifest["completed_frame_indices"], list(range(6)))
+
+    def test_explicit_processing_resolutions_are_unchanged(self):
+        """Regression guard: adding Auto must not disturb the pinned sizes."""
+        for label, expected in (
+            ('1024x576', (1024, 576)),
+            ('1280x720 (experimental)', (1280, 720)),
+            ('1536x864 (experimental)', (1536, 864)),
+            ('2048x1152 (experimental)', (2048, 1152)),
+        ):
+            self.assertEqual(app._processing_work_size(label), expected, label)
+
+    def test_unknown_processing_resolution_still_falls_back(self):
+        self.assertEqual(
+            app._processing_work_size('not-a-resolution'),
+            app._processing_work_size(app.DEFAULT_PROCESSING_RESOLUTION),
+        )
+
+    def test_auto_resolution_resolves_to_concrete_even_dimensions(self):
+        width, height = app._resolve_work_size(
+            app.AUTO_PROCESSING_RESOLUTION, 4096, 2160, frames_in_chunk=2
+        )
+        self.assertIsInstance(width, int)
+        self.assertIsInstance(height, int)
+        self.assertEqual(width % 64, 0)
+        self.assertEqual(height % 64, 0)
+        self.assertGreater(width * height, 0)
+
+    def test_auto_resolution_never_leaks_the_label_into_the_cache_key(self):
+        """session.json's work_size is a cache key.
+
+        If Auto reached it as a string, a resumed run would compare equal
+        regardless of the size its frames were actually built at.
+        """
+        width, height = app._resolve_work_size(
+            app.AUTO_PROCESSING_RESOLUTION, 4096, 2160, frames_in_chunk=2
+        )
+        self.assertNotIsInstance(width, str)
+        self.assertNotIn(app.AUTO_PROCESSING_RESOLUTION, (width, height))
+
+    def test_auto_resolution_respects_the_cuda_grid_limit(self):
+        import model_canvas
+        width, height = app._resolve_work_size(
+            app.AUTO_PROCESSING_RESOLUTION, 8192, 4320, frames_in_chunk=1,
+            available_vram_bytes=200 << 30,
+        )
+        self.assertLessEqual((width // 8) * (height // 8), 65535)
+        self.assertLessEqual(width * height, model_canvas.HARD_CANVAS_PX_LIMIT)
+
+    def test_auto_resolution_does_not_block_reload_on_vram_drift(self):
+        """Auto is sticky per run.
+
+        Re-resolving it against different free VRAM must not raise the
+        "cache is a different size" error, or a machine under memory pressure
+        could never resume a run.
+        """
+        state = {'work_size': [1792, 1280]}
+        app._ensure_loaded_processing_resolution(state, app.AUTO_PROCESSING_RESOLUTION)
+
+    def test_explicit_resolution_mismatch_still_raises(self):
+        state = {'work_size': [1024, 576]}
+        with self.assertRaises(app.gr.Error):
+            app._ensure_loaded_processing_resolution(state, '2048x1152 (experimental)')
+
+    def test_matte_roi_defaults_to_full_frame(self):
+        self.assertEqual(app.DEFAULT_SETTINGS['matte_roi_mode'], 'Full frame')
+
+    def test_videomama_canvas_matches_the_roi_aspect_not_the_fixed_canvas(self):
+        """The stretch bug, pinned.
+
+        A 1200x2000 ROI (aspect 0.60) used to be resized onto the fixed 16:9
+        work canvas, entering the model ~3x wider than reality. The canvas must
+        now carry the ROI's own aspect.
+        """
+        roi = {'enabled': True, 'x': 0, 'y': 0, 'width': 1200, 'height': 2000}
+        width, height, report = app._videomama_canvas(
+            roi, source_size=(4096, 2160), work_size=(2048, 1152), frames_in_chunk=2,
+            available_vram_bytes=20 << 30,
+        )
+        self.assertLess(width, height, 'a portrait ROI must get a portrait canvas')
+        # The achievable aspect error is bounded by the 64px alignment grid: one
+        # step on the short axis moves the aspect by alignment/min(w, h). Assert
+        # against that rather than a magic number, and against the 196% error
+        # the old fixed 2048x1152 canvas produced for this ROI.
+        error = abs((width / height) / (1200 / 2000) - 1.0)
+        self.assertLessEqual(error, 64 / min(width, height))
+        self.assertLess(error, 0.15)
+        self.assertEqual(width % 64, 0)
+        self.assertEqual(height % 64, 0)
+        self.assertIn('limited_by', report)
+
+    def test_videomama_canvas_uses_full_frame_when_no_roi(self):
+        roi = {'enabled': False, 'x': 0, 'y': 0, 'width': 4096, 'height': 2160}
+        width, height, _report = app._videomama_canvas(
+            roi, source_size=(4096, 2160), work_size=(2048, 1152), frames_in_chunk=2,
+            available_vram_bytes=20 << 30,
+        )
+        self.assertLessEqual(abs((width / height) / (4096 / 2160) - 1.0),
+                             64 / min(width, height))
+
+    def test_videomama_canvas_never_exceeds_the_cuda_grid_limit(self):
+        import model_canvas
+        roi = {'enabled': False, 'x': 0, 'y': 0, 'width': 8192, 'height': 4320}
+        width, height, _report = app._videomama_canvas(
+            roi, source_size=(8192, 4320), work_size=(8192, 4320), frames_in_chunk=1,
+            available_vram_bytes=200 << 30,
+        )
+        self.assertLessEqual((width // 8) * (height // 8), 65535)
+        self.assertLessEqual(width * height, model_canvas.HARD_CANVAS_PX_LIMIT)
+
+    def test_pinned_resolution_becomes_a_pixel_budget_not_a_stretch(self):
+        """An explicit resolution keeps its pixel budget but stops distorting.
+
+        2048x1152 is 2.36 Mpx; the canvas it produces for a 4:3 ROI should be
+        near that area while carrying 4:3, rather than literally 2048x1152.
+        """
+        roi = {'enabled': True, 'x': 0, 'y': 0, 'width': 2400, 'height': 1800}
+        width, height, _report = app._videomama_canvas(
+            roi, source_size=(4096, 2160), work_size=(2048, 1152), frames_in_chunk=2,
+            available_vram_bytes=20 << 30,
+        )
+        self.assertLessEqual(width * height, 2048 * 1152)
+        self.assertLessEqual(abs((width / height) / (2400 / 1800) - 1.0),
+                             64 / min(width, height))
+
+    def test_videomama_receives_the_aspect_matched_canvas(self):
+        """End to end: whatever _videomama_canvas decides is what the model gets."""
+        roi = {'enabled': True, 'x': 0, 'y': 0, 'width': 1200, 'height': 2000}
+        expected = app._videomama_canvas(
+            roi, source_size=(4096, 2160), work_size=(2048, 1152), frames_in_chunk=2,
+            available_vram_bytes=20 << 30)[:2]
+        self.assertEqual(expected[0] % 64, 0)
+        self.assertNotEqual(expected, (2048, 1152))
+
+    def test_oom_classifier_accepts_allocator_oom(self):
+        class FakeOOM(Exception):
+            pass
+        FakeOOM.__name__ = 'OutOfMemoryError'
+        self.assertTrue(app._is_recoverable_oom(FakeOOM('CUDA out of memory')))
+        self.assertTrue(app._is_recoverable_oom(
+            RuntimeError('CUDA out of memory. Tried to allocate 5.05 GiB')))
+
+    def test_oom_classifier_rejects_the_cuda_grid_limit(self):
+        """That failure poisons the CUDA context; retrying is not recoverable."""
+        self.assertFalse(app._is_recoverable_oom(
+            RuntimeError('CUDA error: invalid configuration argument')))
+        self.assertFalse(app._is_recoverable_oom(ValueError('some other bug')))
 
     def test_videomama_processes_sam_roi_but_writes_full_frame_alpha(self):
         with tempfile.TemporaryDirectory() as tmpdir:

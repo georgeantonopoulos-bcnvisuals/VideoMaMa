@@ -43,6 +43,16 @@ export VIDEOMAMA_UI_PORT="${VIDEOMAMA_UI_PORT:-7861}"
 export VIDEOMAMA_UI_SHARE="${VIDEOMAMA_UI_SHARE:-1}"
 export SAM3_MODEL_VERSION="${SAM3_MODEL_VERSION:-sam3}"
 
+# EXR plates are ACES scene-linear, so the viewer applies the ACES view
+# transform through OCIO. Point this at an ACES config to override; when it is
+# unset the app searches its own candidate paths and finally falls back to
+# OpenColorIO's built-in ACES config. Note that OCIO reads $OCIO on its own and
+# silently returns a "color management disabled" config when that is unset, so
+# the app deliberately resolves the config itself rather than relying on it.
+if [[ -n "${VIDEOMAMA_OCIO_CONFIG:-}" ]]; then
+  export VIDEOMAMA_OCIO_CONFIG
+fi
+
 # The SAM2Matting backend runs in its own venv and its own process; the UI only
 # needs to know where to find it. Both are also recorded in
 # tmp/runtime-locks/sam2matting-runtime.json, which the app reads as a fallback,

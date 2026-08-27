@@ -56,12 +56,53 @@ For production rotoscoping, use `production_frame_app.py` through
 Runs are saved under `tmp/production_sequence_app`, with a manifest recording
 source fingerprints, prompts, model settings, generated frames, and completion
 status. Chunk overlaps are cross-faded to reduce visible range boundaries.
-EXR previews may use the simple exposure/gamma transform or the server's active
-`OCIO` configuration with an input colorspace, display, and view.
+EXR plates are read as ACES scene-linear by default: the viewer resolves an
+ACES 1.2 OCIO config and applies the `ACES`/`sRGB` view transform, so mid-grey
+lands where it should and highlights above 1.0 roll off instead of clipping to
+white. The `Gamma / Exposure` mode remains available as the legacy raw-linear
+path. Override the config with `VIDEOMAMA_OCIO_CONFIG`; when it is unset the app
+searches its own candidate paths and falls back to OpenColorIO's built-in ACES
+config. The **EXR Color Management** accordion shows which config was resolved.
+
+Note that `$OCIO` alone is not enough: OpenColorIO returns a "color management
+disabled" config when it is unset, which would silently pass the plate through
+untransformed, so the app resolves the config itself.
 When an ROI is enabled, both SAM 3 and VideoMaMa process that source crop at the
 selected working resolution; their masks/mattes are then mapped back into
 full-resolution, full-frame outputs. This avoids shrinking the entire 4K plate
 when only a smaller subject region needs detail.
+
+### Processing resolution
+
+`Processing Resolution` defaults to **Auto (max for GPU)**, which sizes the model
+canvas from the region's own aspect ratio and the GPU's free VRAM instead of
+stretching everything onto a fixed 16:9 canvas. Pinned sizes still work and are
+honoured as a *pixel budget* rather than literal dimensions - a 2325x1641 ROI at
+"2048x1152" becomes 1792x1280, not a 25% horizontal stretch of the subject.
+
+Three limits can bind the canvas, and the run log says which did:
+
+- `vram` - free VRAM, via a measured affine fit
+  (`peak = 4.24 GiB + 2072.8 B/px/frame`). Chunk size trades directly against
+  resolution, because the UNet takes a whole chunk as one temporal batch.
+- `quality-ceiling` - VideoMaMa fine-tunes SVD, trained at 1024x576. Measured on
+  a 4K plate, edge quality stops improving around 1.9 Mpx while cost keeps
+  climbing, so the default cap is 2.36 Mpx. Override with
+  `VIDEOMAMA_CANVAS_CEILING_PX`.
+- `cuda-limit` - a hard cap of 4,194,240 canvas pixels. The temporal attention
+  block launches one CUDA grid slot per latent spatial token and CUDA caps that
+  dimension at 65535. Above it the run dies with `invalid configuration
+  argument` and poisons the CUDA context, so it cannot be retried smaller. This
+  does not depend on GPU size - a bigger card does not lift it.
+
+Auto is capped for the SAM 3 cache stage at the largest resolution already
+proven to run here, because the VRAM fit was measured against VideoMaMa and not
+against SAM 3. Re-measure with `scripts/calibrate_resolution.py` before lifting
+it. SAM2Matting is unaffected either way: it resizes to a 1024 square and emits
+from a 512 decoder head by architecture.
+
+`Matte ROI` now defaults to **Full frame** - nothing is cropped unless you ask
+for it. Auto (from SAM 3 masks) and a manual crop remain available.
 
 The combined quality preset affects both stages: its threshold changes SAM 3,
 while its processing resolution and plate-edge refinement change VideoMaMa.

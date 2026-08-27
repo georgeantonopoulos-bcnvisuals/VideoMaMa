@@ -79,6 +79,7 @@ from tools.painter import mask_painter, point_painter
 # the isolated SAM2Matting worker, and the tests can all import them.
 import matting_backends as mb
 import matte_qc
+import model_canvas
 import sam2matting_client
 import subject_roi
 from alpha_transforms import (
@@ -108,12 +109,66 @@ DEFAULT_SEQUENCE_DIR = "/mnt/production/project/ntf_fire/work/Editing/102_Camera
 DEFAULT_EXR_GAMMA = 1.0
 DEFAULT_EXR_EXPOSURE = 0.0
 EXR_COLOR_MODES = ('Gamma / Exposure', 'OCIO Display')
+
+# EXR plates arrive scene-referred in ACES (ACEScg, reached through the
+# `scene_linear` role), so the viewer has to apply the ACES view transform to
+# show them correctly. Reading them as plain linear and clipping to 0..1 -- the
+# old 'Gamma / Exposure' default with gamma 1.0 -- drops the RRT/ODT tone curve
+# entirely and renders every plate dark and desaturated.
+#
+# OCIO will not resolve `scene_linear` on its own. `ocio.GetCurrentConfig()`
+# reads $OCIO, and when that is unset it returns the built-in "color management
+# disabled" config, whose single colorspace is `raw` -- so the display transform
+# silently degrades to a passthrough instead of raising. The app therefore
+# resolves a real ACES config itself rather than trusting the ambient one.
+DEFAULT_EXR_COLOR_MODE = 'OCIO Display'
+DEFAULT_OCIO_INPUT_COLORSPACE = 'scene_linear'
+DEFAULT_OCIO_DISPLAY = 'ACES'
+DEFAULT_OCIO_VIEW = 'sRGB'
+
+# Searched in order when neither VIDEOMAMA_OCIO_CONFIG nor $OCIO names a usable
+# config. These are ACES 1.2 configs (`scene_linear` -> `ACES - ACEScg`,
+# default display/view `ACES`/`sRGB`).
+ACES_OCIO_CONFIG_CANDIDATES = (
+    "/mnt/production/user/george.antonopoulos/DEV/aces_1.2/config.ocio",
+    "/mnt/production/project/bcn_lib/work/config/aces_1.2/config.ocio",
+)
+
+# Last resort when no ACES 1.2 config file is reachable. OCIO only ships ACES
+# 1.3 built-ins; for the sRGB view used here the 1.3 rendering transform matches
+# 1.2, so this keeps the viewer correct on machines without the production mount.
+ACES_OCIO_BUILTIN_CONFIG = 'ocio://studio-config-v1.0.0_aces-v1.3_ocio-v2.1'
+
+# What a session.json written before `exr_color_settings` existed meant. Runs
+# cached under those settings must NOT compare equal to the ACES defaults above,
+# or their JPEG caches would be reused with the old colour baked in.
+LEGACY_EXR_COLOR_SETTINGS = {
+    'mode': 'Gamma / Exposure',
+    'input_colorspace': 'scene_linear',
+    'display': '',
+    'view': '',
+}
 WORK_WIDTH = 1024
 WORK_HEIGHT = 576
 DEFAULT_PROCESSING_RESOLUTION = f"{WORK_WIDTH}x{WORK_HEIGHT}"
 SAM_CACHE_VERSION = 3
 SAM_KEYFRAME_POLICY_VERSION = 2
+# "Auto" sizes the canvas from the region's own aspect and the GPU's free VRAM
+# instead of stretching everything onto one fixed 16:9 canvas. It resolves to
+# concrete dimensions before anything is cached; the label never reaches a cache
+# key. See demo/model_canvas.py for the sizing rules and the measurements.
+AUTO_PROCESSING_RESOLUTION = "Auto (max for GPU)"
+
+# Ceiling for the SAM 3 cache canvas specifically. The VRAM constants in
+# model_canvas were fitted against VideoMaMa, NOT against SAM 3, so Auto is not
+# allowed to size the SAM stage beyond the largest resolution that already ships
+# and is known to run here. Auto can therefore only change the SAM canvas's
+# *shape*, never push it past today's proven maximum. Lifting this needs its own
+# calibration pass for SAM 3.
+SAM_AUTO_CEILING_PX = 2048 * 1152
+
 PROCESSING_RESOLUTIONS = {
+    AUTO_PROCESSING_RESOLUTION: None,
     "1024x576": (1024, 576),
     "1280x720 (experimental)": (1280, 720),
     "1536x864 (experimental)": (1536, 864),
@@ -152,31 +207,55 @@ DEFAULT_MATTE_ROI_MIN_GAIN = 1.35
 APP_TMP_ROOT = REPO_ROOT / 'tmp' / 'production_sequence_app'
 SETTINGS_PATH = APP_TMP_ROOT / 'ui_settings.json'
 
+# Defaults below follow the VideoMaMa paper and the authors' own inference
+# script, plus a VRAM fit measured on this hardware:
+#
+#   fps=7, motion_bucket_id=127, noise_aug_strength=0.0, mask_cond_mode='vae',
+#   seed=42               -- pipeline_svd_mask.py defaults (upstream).
+#   chunk_size=4          -- the paper trains the temporal stage on 3-frame
+#                            clips and reports consistent quality across 1-24
+#                            frames, so frame count is a weak quality lever.
+#                            4 clears the 3-frame training length while leaving
+#                            enough VRAM for a canvas at the 1024x1024 spatial
+#                            training resolution. The authors' own default of 16
+#                            cannot reach that resolution on a 23GB L4 -- it
+#                            collapses the canvas to 512x576.
+#   overlap=1             -- must be strictly less than chunk_size. overlap ==
+#                            chunk_size makes step 1, so every frame is matted
+#                            twice and cross-faded with a near-independent
+#                            result: softer edges, and their disagreement reads
+#                            as wobble.
+#   edge settings         -- the 'Hair Detail' preset's values. GrabCut and the
+#                            guided filter both simplify thin boundaries (see
+#                            their own comments), so both are off and the
+#                            conditioning guide is expanded by 8px.
 DEFAULT_SETTINGS = {
     'sequence_dir': DEFAULT_SEQUENCE_DIR,
     'exr_gamma': DEFAULT_EXR_GAMMA,
     'exr_exposure': DEFAULT_EXR_EXPOSURE,
-    'exr_color_mode': 'Gamma / Exposure',
-    'ocio_input_colorspace': os.environ.get('VIDEOMAMA_OCIO_INPUT_COLORSPACE', 'scene_linear'),
-    'ocio_display': os.environ.get('VIDEOMAMA_OCIO_DISPLAY', ''),
-    'ocio_view': os.environ.get('VIDEOMAMA_OCIO_VIEW', ''),
+    'exr_color_mode': os.environ.get('VIDEOMAMA_EXR_COLOR_MODE', DEFAULT_EXR_COLOR_MODE),
+    'ocio_input_colorspace': os.environ.get(
+        'VIDEOMAMA_OCIO_INPUT_COLORSPACE', DEFAULT_OCIO_INPUT_COLORSPACE
+    ),
+    'ocio_display': os.environ.get('VIDEOMAMA_OCIO_DISPLAY', DEFAULT_OCIO_DISPLAY),
+    'ocio_view': os.environ.get('VIDEOMAMA_OCIO_VIEW', DEFAULT_OCIO_VIEW),
     'prompt_mode': 'Point keyframes',
     'concept_prompt': '',
     'point_mode': 'Positive',
-    'quality_preset': 'Balanced',
-    'sam_output_prob_thresh': 0.5,
+    'quality_preset': 'Hair Detail',
+    'sam_output_prob_thresh': 0.2,
     'sam_preview_height': 720,
     'sam_overlay_opacity': MASK_ALPHA,
-    'sam_refine_edges_against_plate': True,
+    'sam_refine_edges_against_plate': False,
     'videomama_mask_cond_mode': 'vae',
     'videomama_seed': 42,
     'videomama_fps': 7,
     'videomama_motion_bucket_id': 127,
     'videomama_noise_aug_strength': 0.0,
-    'videomama_guide_expand_px': 0,
+    'videomama_guide_expand_px': 8,
     'videomama_guide_source': VIDEOMAMA_GUIDE_SAM3,
     'videomama_guide_threshold': 0.5,
-    'processing_resolution': DEFAULT_PROCESSING_RESOLUTION,
+    'processing_resolution': AUTO_PROCESSING_RESOLUTION,
     'sam_crop_enabled': False,
     'sam_crop_x': 0,
     'sam_crop_y': 0,
@@ -186,7 +265,7 @@ DEFAULT_SETTINGS = {
     'tracking_model': os.environ.get('SAM3_MODEL_VERSION', 'sam3'),
     'matting_backend': mb.SAM2MATTING_BASE_PLUS.label,
     's2m_backend': mb.SAM2MATTING_BASE_PLUS.label,
-    'matte_roi_mode': MATTE_ROI_MODES[0],
+    'matte_roi_mode': 'Full frame',
     'matte_roi_padding': DEFAULT_MATTE_ROI_PADDING,
     'matte_roi_min_gain': DEFAULT_MATTE_ROI_MIN_GAIN,
     's2m_conditioning': mb.DEFAULT_CONDITIONING_LABEL,
@@ -199,8 +278,8 @@ DEFAULT_SETTINGS = {
     'matte_qc_enabled': True,
     'free_gpu_after_run': True,
     'alpha_output_format': '16-bit PNG',
-    'chunk_size': 16,
-    'overlap': 4,
+    'chunk_size': 4,
+    'overlap': 1,
     'custom_output_dir': '',
     'resume_from_tmp': True,
     'range_start': 0,
@@ -247,7 +326,7 @@ QUALITY_PRESETS = {
         'videomama_fps': 7,
         'videomama_motion_bucket_id': 127,
         'videomama_noise_aug_strength': 0.0,
-        'processing_resolution': '2048x1152 (experimental)',
+        'processing_resolution': AUTO_PROCESSING_RESOLUTION,
         'sam_refine_edges_against_plate': True,
         'videomama_guide_expand_px': 0,
         'refine_edges_against_plate': True,
@@ -258,7 +337,7 @@ QUALITY_PRESETS = {
         'videomama_fps': 7,
         'videomama_motion_bucket_id': 127,
         'videomama_noise_aug_strength': 0.0,
-        'processing_resolution': '2048x1152 (experimental)',
+        'processing_resolution': AUTO_PROCESSING_RESOLUTION,
         # GrabCut and the final guided filter both simplify thin, irregular
         # boundaries. Preserve SAM's raw contour for wisps and flyaways.
         'sam_refine_edges_against_plate': False,
@@ -711,8 +790,8 @@ def _save_ui_settings(sequence_dir, exr_gamma, exr_exposure, exr_color_mode,
         'sequence_dir': str(sequence_dir),
         'exr_gamma': float(exr_gamma),
         'exr_exposure': float(exr_exposure),
-        'exr_color_mode': str(exr_color_mode or 'Gamma / Exposure'),
-        'ocio_input_colorspace': str(ocio_input_colorspace or 'scene_linear'),
+        'exr_color_mode': str(exr_color_mode or DEFAULT_EXR_COLOR_MODE),
+        'ocio_input_colorspace': str(ocio_input_colorspace or DEFAULT_OCIO_INPUT_COLORSPACE),
         'ocio_display': str(ocio_display or ''),
         'ocio_view': str(ocio_view or ''),
         'prompt_mode': str(prompt_mode),
@@ -790,11 +869,66 @@ def resize_sam_previews(height):
     return tuple(gr.update(height=height) for _ in range(5))
 
 
+def _is_auto_resolution(processing_resolution):
+    return str(processing_resolution or '') == AUTO_PROCESSING_RESOLUTION
+
+
 def _processing_work_size(processing_resolution):
+    """The pinned canvas for an explicit resolution label.
+
+    Auto has no answer without a region, so it falls back to the default here.
+    Callers that can supply a region must use `_resolve_work_size` instead.
+    """
     label = str(processing_resolution or DEFAULT_PROCESSING_RESOLUTION)
-    if label not in PROCESSING_RESOLUTIONS:
+    if label not in PROCESSING_RESOLUTIONS or PROCESSING_RESOLUTIONS[label] is None:
         label = DEFAULT_PROCESSING_RESOLUTION
     return PROCESSING_RESOLUTIONS[label]
+
+
+def _resolve_work_size(processing_resolution, region_w, region_h, frames_in_chunk=1,
+                       available_vram_bytes=None, ceiling_px=None, report=None):
+    """Concrete (width, height) for this region, honouring Auto.
+
+    Always returns plain ints. Auto must never survive into session.json or a
+    run manifest as a label: `work_size` is part of the cache identity, and a
+    resumed run comparing "Auto" to "Auto" would happily reuse frames that were
+    built at a different size.
+    """
+    if not _is_auto_resolution(processing_resolution):
+        return _processing_work_size(processing_resolution)
+
+    width, height, detail = model_canvas.canvas_for_region(
+        region_w, region_h,
+        frames_in_chunk=max(1, int(frames_in_chunk)),
+        available_vram_bytes=available_vram_bytes,
+        ceiling_px=_canvas_ceiling_px() if ceiling_px is None else int(ceiling_px),
+    )
+    if report is not None:
+        report.update(detail)
+    return int(width), int(height)
+
+
+def _canvas_ceiling_px():
+    """Quality ceiling for the VideoMaMa canvas, overridable per site."""
+    raw = os.environ.get('VIDEOMAMA_CANVAS_CEILING_PX', '').strip()
+    if raw:
+        try:
+            value = int(raw)
+            if value > 0:
+                return value
+        except ValueError:
+            pass
+    return model_canvas.DEFAULT_CEILING_PX
+
+
+def _sam_region_size(frame_sizes, crop_settings):
+    """The source-pixel region the SAM canvas has to represent."""
+    crop = dict(crop_settings or _sam_crop_settings())
+    if crop.get('enabled') and int(crop.get('width', 0)) > 0 and int(crop.get('height', 0)) > 0:
+        return int(crop['width']), int(crop['height'])
+    if frame_sizes:
+        return int(frame_sizes[0][0]), int(frame_sizes[0][1])
+    return WORK_WIDTH, WORK_HEIGHT
 
 
 def _work_size_from_state(state):
@@ -1001,8 +1135,8 @@ def _load_state_rgb_frame(state, frame_idx):
         state['frame_paths'][int(frame_idx)],
         exr_gamma=state['exr_gamma'],
         exr_exposure=state.get('exr_exposure', 0.0),
-        exr_color_mode=color.get('mode', 'Gamma / Exposure'),
-        ocio_input_colorspace=color.get('input_colorspace', 'scene_linear'),
+        exr_color_mode=color.get('mode', DEFAULT_EXR_COLOR_MODE),
+        ocio_input_colorspace=color.get('input_colorspace', DEFAULT_OCIO_INPUT_COLORSPACE),
         ocio_display=color.get('display', ''),
         ocio_view=color.get('view', ''),
     )
@@ -1077,22 +1211,120 @@ def _ensure_videomama_pipeline(device):
     return videomama_pipeline
 
 
-def _apply_ocio_display(image: np.ndarray, input_colorspace: str = 'scene_linear',
-                        display: str = '', view: str = '') -> np.ndarray:
+def _ocio_config_sources():
+    """Candidate OCIO configs, most explicit first.
+
+    Yields ``(source_label, loader)`` pairs. Loading is deferred so an
+    unreachable mount or a malformed file only costs the candidate that names
+    it, not the whole search.
+    """
+    import PyOpenColorIO as ocio
+
+    explicit = os.environ.get('VIDEOMAMA_OCIO_CONFIG', '').strip()
+    if explicit:
+        yield f"VIDEOMAMA_OCIO_CONFIG={explicit}", lambda: ocio.Config.CreateFromFile(explicit)
+
+    ambient = os.environ.get('OCIO', '').strip()
+    if ambient:
+        yield f"OCIO={ambient}", lambda: ocio.Config.CreateFromFile(ambient)
+
+    for candidate in ACES_OCIO_CONFIG_CANDIDATES:
+        if Path(candidate).is_file():
+            yield candidate, (lambda path=candidate: ocio.Config.CreateFromFile(path))
+
+    yield ACES_OCIO_BUILTIN_CONFIG, lambda: ocio.Config.CreateFromBuiltinConfig(
+        ACES_OCIO_BUILTIN_CONFIG.removeprefix('ocio://')
+    )
+
+
+def _config_resolves_colorspace(config, name: str) -> bool:
+    """True when `name` is a real colorspace or role in `config`.
+
+    This is the guard against OCIO's "color management disabled" fallback
+    config, which answers `GetCurrentConfig()` when $OCIO is unset. That config
+    exposes only `raw`, so a `scene_linear` lookup returns None and the display
+    transform would otherwise degrade to a silent passthrough.
+    """
     try:
-        import PyOpenColorIO as ocio
+        return config.getColorSpace(name) is not None
+    except Exception:
+        return False
+
+
+_OCIO_CONFIG_CACHE = {}
+
+
+def _resolve_ocio_config(input_colorspace: str = DEFAULT_OCIO_INPUT_COLORSPACE):
+    """Load the first OCIO config that can actually resolve `input_colorspace`."""
+    try:
+        import PyOpenColorIO as ocio  # noqa: F401
     except ImportError as exc:
         raise RuntimeError(
             'OCIO Display mode requires the `opencolorio` package in the SAM 3 UI environment.'
         ) from exc
 
-    config = ocio.GetCurrentConfig()
-    display = str(display or config.getDefaultDisplay())
-    view = str(view or config.getDefaultView(display))
-    input_colorspace = str(input_colorspace or ocio.ROLE_SCENE_LINEAR)
+    input_colorspace = str(input_colorspace or DEFAULT_OCIO_INPUT_COLORSPACE)
+    cached = _OCIO_CONFIG_CACHE.get(input_colorspace)
+    if cached is not None:
+        return cached
+
+    attempts = []
+    for source, loader in _ocio_config_sources():
+        try:
+            config = loader()
+        except Exception as exc:
+            attempts.append(f"{source}: {exc}")
+            continue
+        if not _config_resolves_colorspace(config, input_colorspace):
+            attempts.append(f"{source}: no colorspace or role named {input_colorspace!r}")
+            continue
+        _OCIO_CONFIG_CACHE[input_colorspace] = (config, source)
+        return config, source
+
+    raise RuntimeError(
+        f"No OCIO config could resolve the input colorspace {input_colorspace!r}. "
+        "Point VIDEOMAMA_OCIO_CONFIG (or $OCIO) at an ACES config. Tried:\n  "
+        + "\n  ".join(attempts)
+    )
+
+
+def _ocio_status_markdown(input_colorspace: str = DEFAULT_OCIO_INPUT_COLORSPACE) -> str:
+    """One-line readout of which OCIO config the viewer resolved, for the UI.
+
+    Colour problems here are silent by nature -- a wrong config shows a plausible
+    but incorrect image -- so surface the binding instead of making the artist
+    infer it from the plate.
+    """
+    try:
+        config, source = _resolve_ocio_config(input_colorspace)
+    except RuntimeError as exc:
+        return f"**OCIO config:** unavailable - {exc}"
+    resolved = config.getColorSpace(input_colorspace)
+    resolved_name = resolved.getName() if resolved is not None else input_colorspace
+    return f"**OCIO config:** `{source}` - `{input_colorspace}` resolves to `{resolved_name}`"
+
+
+def _apply_ocio_display(image: np.ndarray, input_colorspace: str = DEFAULT_OCIO_INPUT_COLORSPACE,
+                        display: str = '', view: str = '') -> np.ndarray:
+    import PyOpenColorIO as ocio
+
+    input_colorspace = str(input_colorspace or DEFAULT_OCIO_INPUT_COLORSPACE)
+    config, config_source = _resolve_ocio_config(input_colorspace)
+
+    # An explicit display/view wins; otherwise prefer the ACES pair and fall back
+    # to whatever the config calls default, so non-ACES configs still work.
+    display = str(display or '')
+    if not display:
+        available = list(config.getDisplays())
+        display = DEFAULT_OCIO_DISPLAY if DEFAULT_OCIO_DISPLAY in available else config.getDefaultDisplay()
+    view = str(view or '')
+    if not view:
+        available = list(config.getViews(display))
+        view = DEFAULT_OCIO_VIEW if DEFAULT_OCIO_VIEW in available else config.getDefaultView(display)
     if not display or not view:
         raise RuntimeError(
-            'The active OCIO config does not provide a display/view. Set OCIO or enter explicit values.'
+            f"The OCIO config from {config_source} does not provide a display/view. "
+            'Enter explicit values in EXR Color Management.'
         )
     try:
         processor = config.getProcessor(
@@ -1103,7 +1335,8 @@ def _apply_ocio_display(image: np.ndarray, input_colorspace: str = 'scene_linear
         ).getDefaultCPUProcessor()
     except Exception as exc:
         raise RuntimeError(
-            f"Could not build OCIO transform from {input_colorspace!r} to {display!r}/{view!r}: {exc}"
+            f"Could not build OCIO transform from {input_colorspace!r} to "
+            f"{display!r}/{view!r} using the config from {config_source}: {exc}"
         ) from exc
     transformed = np.ascontiguousarray(image.astype(np.float32, copy=True))
     height, width = transformed.shape[:2]
@@ -1113,8 +1346,8 @@ def _apply_ocio_display(image: np.ndarray, input_colorspace: str = 'scene_linear
 
 
 def _read_exr_rgb(image_path: str, exr_gamma: float = DEFAULT_EXR_GAMMA,
-                  exr_exposure: float = 0.0, exr_color_mode: str = 'Gamma / Exposure',
-                  ocio_input_colorspace: str = 'scene_linear', ocio_display: str = '',
+                  exr_exposure: float = 0.0, exr_color_mode: str = DEFAULT_EXR_COLOR_MODE,
+                  ocio_input_colorspace: str = DEFAULT_OCIO_INPUT_COLORSPACE, ocio_display: str = '',
                   ocio_view: str = '') -> np.ndarray:
     exr_gamma = float(exr_gamma)
     if exr_gamma <= 0.0:
@@ -1153,7 +1386,8 @@ def _read_exr_rgb(image_path: str, exr_gamma: float = DEFAULT_EXR_GAMMA,
 
 
 def _load_rgb_frame(image_path: str, exr_gamma: float, exr_exposure: float = DEFAULT_EXR_EXPOSURE,
-                    exr_color_mode: str = 'Gamma / Exposure', ocio_input_colorspace: str = 'scene_linear',
+                    exr_color_mode: str = DEFAULT_EXR_COLOR_MODE,
+                    ocio_input_colorspace: str = DEFAULT_OCIO_INPUT_COLORSPACE,
                     ocio_display: str = '', ocio_view: str = '') -> np.ndarray:
     suffix = Path(image_path).suffix.lower()
     if suffix == ".exr":
@@ -1470,8 +1704,8 @@ def load_sam_crop_selector(sequence_dir, exr_gamma, exr_exposure, exr_color_mode
         'frame_path': str(frame_path),
         'exr_gamma': float(exr_gamma),
         'exr_exposure': float(exr_exposure),
-        'exr_color_mode': str(exr_color_mode or 'Gamma / Exposure'),
-        'ocio_input_colorspace': str(ocio_input_colorspace or 'scene_linear'),
+        'exr_color_mode': str(exr_color_mode or DEFAULT_EXR_COLOR_MODE),
+        'ocio_input_colorspace': str(ocio_input_colorspace or DEFAULT_OCIO_INPUT_COLORSPACE),
         'ocio_display': str(ocio_display or ''),
         'ocio_view': str(ocio_view or ''),
         'points': [],
@@ -1627,12 +1861,8 @@ def _find_existing_run(sequence_dir: str, frame_names, work_size=None, exr_gamma
                          or list(meta.get('source_fingerprints')) == list(source_fingerprints))
                     and (
                         not exr_color_settings
-                        or dict(meta.get('exr_color_settings') or {
-                            'mode': 'Gamma / Exposure',
-                            'input_colorspace': 'scene_linear',
-                            'display': '',
-                            'view': '',
-                        }) == dict(exr_color_settings)
+                        or dict(meta.get('exr_color_settings')
+                                or LEGACY_EXR_COLOR_SETTINGS) == dict(exr_color_settings)
                     )
                     and dict(meta.get('sam_crop_settings') or _sam_crop_settings())
                         == expected_crop_settings
@@ -2207,27 +2437,25 @@ def load_sequence(sequence_dir: str, exr_gamma: float, exr_exposure: float = DEF
                   processing_resolution: str = DEFAULT_PROCESSING_RESOLUTION,
                   sam_crop_enabled: bool = False, sam_crop_x: int = 0, sam_crop_y: int = 0,
                   sam_crop_width: int = 0, sam_crop_height: int = 0,
-                  exr_color_mode: str = 'Gamma / Exposure',
-                  ocio_input_colorspace: str = 'scene_linear', ocio_display: str = '',
+                  exr_color_mode: str = DEFAULT_EXR_COLOR_MODE,
+                  ocio_input_colorspace: str = DEFAULT_OCIO_INPUT_COLORSPACE, ocio_display: str = '',
                   ocio_view: str = '',
                   progress=gr.Progress()):
     exr_gamma = float(exr_gamma)
     exr_exposure = float(exr_exposure)
     if exr_gamma <= 0.0:
         raise gr.Error('EXR Gamma must be greater than zero.')
-    exr_color_mode = str(exr_color_mode or 'Gamma / Exposure')
+    exr_color_mode = str(exr_color_mode or DEFAULT_EXR_COLOR_MODE)
     if exr_color_mode not in EXR_COLOR_MODES:
         raise gr.Error(f"Unsupported EXR color mode: {exr_color_mode}")
     exr_color_settings = {
         'mode': exr_color_mode,
-        'input_colorspace': str(ocio_input_colorspace or 'scene_linear'),
+        'input_colorspace': str(ocio_input_colorspace or DEFAULT_OCIO_INPUT_COLORSPACE),
         'display': str(ocio_display or ''),
         'view': str(ocio_view or ''),
     }
     prompt_mode = str(prompt_mode or 'Point keyframes')
     concept_prompt = str(concept_prompt or '').strip()
-    work_size = _processing_work_size(processing_resolution)
-    work_width, work_height = work_size
     crop_settings = _sam_crop_settings(
         sam_crop_enabled, sam_crop_x, sam_crop_y, sam_crop_width, sam_crop_height
     )
@@ -2235,6 +2463,20 @@ def load_sequence(sequence_dir: str, exr_gamma: float, exr_exposure: float = DEF
     source_fingerprints = _source_fingerprints(frame_paths)
     frame_names = [path.name for path in frame_paths]
     frame_sizes = [_image_size(str(path)) for path in frame_paths]
+    # Auto needs the region before it can size anything, so the canvas is
+    # resolved after the frames are discovered rather than from the label alone.
+    # SAM_AUTO_CEILING_PX keeps Auto from pushing this stage past the largest
+    # resolution already proven to run here -- the VRAM fit is VideoMaMa's.
+    sam_region_w, sam_region_h = _sam_region_size(frame_sizes, crop_settings)
+    sam_canvas_report = {}
+    work_size = _resolve_work_size(
+        processing_resolution, sam_region_w, sam_region_h, frames_in_chunk=1,
+        ceiling_px=SAM_AUTO_CEILING_PX, report=sam_canvas_report,
+    )
+    work_width, work_height = work_size
+    if sam_canvas_report:
+        print(f"SAM canvas: {sam_canvas_report.get('summary')} "
+              f"[bound by {sam_canvas_report.get('limited_by')}]")
     frame_transforms = [
         _sam_crop_transform(width, height, work_size=work_size, crop_settings=crop_settings)
         for width, height in frame_sizes
@@ -2268,12 +2510,9 @@ def load_sequence(sequence_dir: str, exr_gamma: float, exr_exposure: float = DEF
                 cached_meta = json.load(f)
             cached_gamma = float(cached_meta.get('exr_gamma'))
             cached_exposure = float(cached_meta.get('exr_exposure', 0.0))
-            cached_color_settings = dict(cached_meta.get('exr_color_settings') or {
-                'mode': 'Gamma / Exposure',
-                'input_colorspace': 'scene_linear',
-                'display': '',
-                'view': '',
-            })
+            cached_color_settings = dict(
+                cached_meta.get('exr_color_settings') or LEGACY_EXR_COLOR_SETTINGS
+            )
             cached_transforms = cached_meta.get('frame_transforms') or []
             cached_has_letterbox_meta = len(cached_transforms) == len(frame_paths)
             cached_sam_cache_version = int(cached_meta.get('sam_cache_version', 0))
@@ -2463,8 +2702,8 @@ def clear_sequence_cache_and_reload(state, sequence_dir: str, exr_gamma: float, 
                                     processing_resolution: str = DEFAULT_PROCESSING_RESOLUTION,
                                     sam_crop_enabled: bool = False, sam_crop_x: int = 0, sam_crop_y: int = 0,
                                     sam_crop_width: int = 0, sam_crop_height: int = 0,
-                                    exr_color_mode: str = 'Gamma / Exposure',
-                                    ocio_input_colorspace: str = 'scene_linear', ocio_display: str = '',
+                                    exr_color_mode: str = DEFAULT_EXR_COLOR_MODE,
+                                    ocio_input_colorspace: str = DEFAULT_OCIO_INPUT_COLORSPACE, ocio_display: str = '',
                                     ocio_view: str = ''):
     """Delete this sequence's current app cache/run directory, then load fresh frames."""
     removed = []
@@ -2484,8 +2723,8 @@ def clear_sequence_cache_and_reload(state, sequence_dir: str, exr_gamma: float, 
                 exr_exposure=exr_exposure,
                 source_fingerprints=_source_fingerprints(frame_paths),
                 exr_color_settings={
-                    'mode': str(exr_color_mode or 'Gamma / Exposure'),
-                    'input_colorspace': str(ocio_input_colorspace or 'scene_linear'),
+                    'mode': str(exr_color_mode or DEFAULT_EXR_COLOR_MODE),
+                    'input_colorspace': str(ocio_input_colorspace or DEFAULT_OCIO_INPUT_COLORSPACE),
                     'display': str(ocio_display or ''),
                     'view': str(ocio_view or ''),
                 },
@@ -2770,6 +3009,11 @@ def _normalized_prompt_dict(state):
 
 def _ensure_loaded_processing_resolution(state, processing_resolution):
     if processing_resolution is None:
+        return
+    if _is_auto_resolution(processing_resolution):
+        # Auto is sticky per run: the loaded cache's concrete size IS the answer
+        # for this run. Re-resolving it against whatever VRAM happens to be free
+        # now would spuriously refuse to resume on a busy machine.
         return
     selected_size = _processing_work_size(processing_resolution)
     loaded_size = _work_size_from_state(state)
@@ -3150,6 +3394,69 @@ class _MatteSink:
         self.pending.clear()
 
 
+# How many times a chunk may be retried at a smaller canvas after an OOM.
+_VIDEOMAMA_OOM_RETRIES = 3
+
+
+def _is_recoverable_oom(exc):
+    """True only for allocator OOM, which leaves the CUDA context usable.
+
+    Deliberately narrow. A CUDA grid-limit failure ('invalid configuration
+    argument') reports as a CUDA error but poisons the context: retrying after
+    one produces misleading follow-on errors rather than a working run.
+    """
+    if exc.__class__.__name__ == 'OutOfMemoryError':
+        return True
+    text = str(exc).lower()
+    return 'out of memory' in text and 'invalid configuration' not in text
+
+
+def _videomama_canvas(roi, source_size, work_size, frames_in_chunk,
+                      processing_resolution=None, available_vram_bytes=None):
+    """The canvas VideoMaMa actually runs on, for this ROI.
+
+    Previously the ROI was resized straight onto `work_size` with a plain
+    non-uniform resize. When the ROI's aspect differed from that fixed canvas
+    the subject entered the model distorted -- measured at 1.26x for a 2325x1641
+    ROI, and 3.56x for a portrait one -- which is out-of-distribution for a
+    model trained on undistorted footage, and decimated the two axes unequally.
+
+    Both paths now go through the same aspect-matched sizing; they differ only
+    in where the pixel budget comes from:
+
+      Auto      free VRAM, via the affine peak-memory fit, capped by the quality
+                ceiling and the hard CUDA grid limit.
+      pinned    the chosen label's own area. "2048x1152" keeps meaning 2.36 Mpx,
+                but the shape now follows the ROI instead of being forced to
+                16:9. Measured on a real plate, this was better AND cheaper:
+                band width 7.191 vs 7.290 px at 19% fewer pixels, 13% less VRAM
+                and 24% less time.
+    """
+    roi = dict(roi or {})
+    if roi.get('enabled') and int(roi.get('width', 0)) > 0 and int(roi.get('height', 0)) > 0:
+        region_w, region_h = int(roi['width']), int(roi['height'])
+    else:
+        region_w, region_h = int(source_size[0]), int(source_size[1])
+
+    frames_in_chunk = max(1, int(frames_in_chunk))
+    if _is_auto_resolution(processing_resolution):
+        ceiling_px = _canvas_ceiling_px()
+    else:
+        # A pinned label is honoured as an area, not as literal dimensions.
+        # Real VRAM still clamps it, so a pinned budget can never OOM by itself.
+        ceiling_px = max(1, int(work_size[0]) * int(work_size[1]))
+
+    width, height, report = model_canvas.canvas_for_region(
+        region_w, region_h,
+        frames_in_chunk=frames_in_chunk,
+        available_vram_bytes=available_vram_bytes,
+        ceiling_px=ceiling_px,
+    )
+    report['pinned_label'] = None if _is_auto_resolution(processing_resolution) else \
+        str(processing_resolution or '')
+    return int(width), int(height), report
+
+
 def _run_videomama_pass(state, sink, roi, range_start, range_end, work_size,
                         chunk_size, overlap, params, progress, guide_loader=None):
     """The original chunked VideoMaMa matting loop, unchanged in behaviour.
@@ -3166,6 +3473,22 @@ def _run_videomama_pass(state, sink, roi, range_start, range_end, work_size,
     device = 'cuda' if _cuda_available() else 'cpu'
     _unload_sam3_tracker()
     pipeline = _ensure_videomama_pipeline(device)
+
+    # One canvas for the whole pass: the ROI is fixed for the range, so the
+    # sampling grid the model sees must not move between chunks.
+    canvas_width, canvas_height, canvas_report = _videomama_canvas(
+        roi, (source_width, source_height), work_size, frames_in_chunk=chunk_size,
+        processing_resolution=state.get('processing_resolution'),
+    )
+    model_canvas_size = (canvas_width, canvas_height)
+    if canvas_report.get('below_min_budget'):
+        print(f"WARNING: chunk size {chunk_size} leaves only "
+              f"{canvas_report.get('canvas_px', 0) / 1e6:.2f} Mpx per frame, below VideoMaMa's "
+              f"1024x576 training size. Reduce VideoMaMa Chunk Size for a larger canvas.")
+    print(f"VideoMaMa canvas: {canvas_report.get('summary')} "
+          f"[bound by {canvas_report.get('limited_by')}, "
+          f"{canvas_report.get('latent_tokens')}/65535 latent tokens, "
+          f"predicted peak {canvas_report.get('predicted_peak_bytes', 0) / 2 ** 30:.1f} GiB]")
 
     chunk_starts = list(range(range_start, range_end + 1, step))
     for chunk_number, start in enumerate(chunk_starts, start=1):
@@ -3195,18 +3518,43 @@ def _run_videomama_pass(state, sink, roi, range_start, range_end, work_size,
                 _expand_videomama_guide(refinement_mask, params.guide_expand_px)
             )
 
-        output_frames = videomama(
-            pipeline,
-            model_frames_np,
-            model_masks_np,
-            seed=params.seed,
-            mask_cond_mode=params.mask_cond_mode,
-            fps=params.fps,
-            motion_bucket_id=params.motion_bucket_id,
-            noise_aug_strength=params.noise_aug_strength,
-            target_size=work_size,
-            frame_indices=frame_indices,
-        )
+        # The peak-memory prediction is an estimate fitted on one machine, so a
+        # wrong estimate must cost a retry rather than the whole run. A torch
+        # OOM is recoverable; the CUDA grid-limit failure is not, and
+        # canvas_for_region already refuses to propose a canvas that could hit
+        # it. The reduced canvas is adopted for every remaining chunk so the
+        # sampling grid stays fixed for the rest of the pass.
+        output_frames = None
+        for attempt in range(_VIDEOMAMA_OOM_RETRIES + 1):
+            try:
+                output_frames = videomama(
+                    pipeline,
+                    model_frames_np,
+                    model_masks_np,
+                    seed=params.seed,
+                    mask_cond_mode=params.mask_cond_mode,
+                    fps=params.fps,
+                    motion_bucket_id=params.motion_bucket_id,
+                    noise_aug_strength=params.noise_aug_strength,
+                    target_size=model_canvas_size,
+                    frame_indices=frame_indices,
+                )
+                break
+            except Exception as exc:
+                if not _is_recoverable_oom(exc) or attempt == _VIDEOMAMA_OOM_RETRIES:
+                    raise
+                smaller = model_canvas.shrink_canvas(*model_canvas_size)
+                if smaller == model_canvas_size:
+                    raise
+                print(
+                    f"VideoMaMa OOM at {model_canvas_size[0]}x{model_canvas_size[1]} "
+                    f"(chunk {chunk_size}); retrying at {smaller[0]}x{smaller[1]}. "
+                    f"Lower VideoMaMa Chunk Size to keep a larger canvas."
+                )
+                model_canvas_size = smaller
+                _free_cuda_cache()
+        if output_frames is None:
+            raise RuntimeError('VideoMaMa produced no output for this chunk.')
         if len(output_frames) != len(chunk_frame_names):
             raise RuntimeError(
                 f"VideoMaMa returned {len(output_frames)} outputs for a "
@@ -3830,13 +4178,21 @@ with gr.Blocks(title='VideoMaMa Production Sequence App', css=APP_CSS, js=APP_JS
                             label='EXR Exposure (stops)', value=_settings['exr_exposure'], precision=2
                         )
                     with gr.Accordion('EXR Color Management', open=False):
+                        gr.Markdown(_ocio_status_markdown())
                         exr_color_mode = gr.Radio(
                             list(EXR_COLOR_MODES),
                             value=_settings['exr_color_mode'],
                             label='EXR Display Transform',
+                            info=(
+                                'OCIO Display reads EXRs as ACES scene-linear and applies the '
+                                'ACES view transform. Gamma / Exposure is the legacy raw-linear '
+                                'path and ignores the OCIO settings below.'
+                            ),
                         )
                         ocio_input_colorspace = gr.Textbox(
-                            label='OCIO Input Colorspace', value=_settings['ocio_input_colorspace']
+                            label='OCIO Input Colorspace',
+                            value=_settings['ocio_input_colorspace'],
+                            info="How the EXRs are encoded. 'scene_linear' resolves to ACEScg.",
                         )
                         with gr.Row():
                             ocio_display = gr.Textbox(
@@ -3869,7 +4225,13 @@ with gr.Blocks(title='VideoMaMa Production Sequence App', css=APP_CSS, js=APP_JS
                         list(PROCESSING_RESOLUTIONS.keys()),
                         value=_settings['processing_resolution'],
                         label='Processing Resolution',
-                        info='Reload the sequence after changing this working resolution.',
+                        info=(
+                            'Reload the sequence after changing this working resolution. '
+                            'Auto sizes the canvas from the region shape and free VRAM. '
+                            'Pinned sizes are honoured as a pixel budget, not literal '
+                            'dimensions: the canvas always carries the region aspect now, '
+                            'so the subject is no longer stretched into the model.'
+                        ),
                     )
                     with gr.Accordion('SAM Source ROI Crop (higher detail)', open=False):
                         sam_crop_enabled = gr.Checkbox(
