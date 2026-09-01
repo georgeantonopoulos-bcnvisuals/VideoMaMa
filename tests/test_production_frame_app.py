@@ -255,6 +255,25 @@ class ProductionUtilityTests(unittest.TestCase):
         self.assertIn("imageWasAdded", app.APP_JS)
         self.assertIn("readout.textContent !== label", app.APP_JS)
 
+    def test_sam_overlay_draws_internal_background_contours(self):
+        frame = np.full((64, 64, 3), 127, dtype=np.uint8)
+        mask = np.zeros((64, 64), dtype=np.uint8)
+        mask[12:52, 12:52] = 255
+        mask[24:40, 24:40] = 0
+
+        painted = app.mask_painter(
+            frame,
+            mask,
+            mask_color=5,
+            mask_alpha=0.0,
+            contour_color=1,
+            contour_width=1,
+        )
+
+        red = np.all(painted == np.array([255, 0, 0], dtype=np.uint8), axis=2)
+        self.assertTrue(np.any(red[22:42, 22:42]))
+        np.testing.assert_array_equal(painted[32, 32], frame[32, 32])
+
     def test_zoomed_overlay_maps_clicks_to_sam_prompt_coordinates(self):
         self.assertEqual(app.overlay_point_x.elem_id, "sam_overlay_point_x")
         self.assertEqual(app.overlay_point_y.elem_id, "sam_overlay_point_y")
@@ -551,6 +570,52 @@ class ProductionUtilityTests(unittest.TestCase):
 
 
 class WrapperContractTests(unittest.TestCase):
+    def test_point_mask_threshold_uses_raw_sam_logits(self):
+        tracker = sam3_wrapper_hf.SAM3VideoTracker.__new__(sam3_wrapper_hf.SAM3VideoTracker)
+        logits = np.array([[-4.0, -1.0, 0.0, 1.0, 4.0]], dtype=np.float32)
+        outputs = {
+            "_point_mask_logits": logits,
+            "_point_mask_logits_obj_id": 1,
+            "out_obj_ids": [1],
+            "out_binary_masks": [logits > 0],
+        }
+
+        loose = tracker._extract_mask(outputs, (1, 5), obj_id=1, mask_threshold=0.1)
+        medium = tracker._extract_mask(outputs, (1, 5), obj_id=1, mask_threshold=0.5)
+        tight = tracker._extract_mask(outputs, (1, 5), obj_id=1, mask_threshold=0.9)
+
+        self.assertEqual(int((loose > 0).sum()), 4)
+        self.assertEqual(int((medium > 0).sum()), 3)
+        self.assertEqual(int((tight > 0).sum()), 1)
+
+    def test_point_mask_logits_are_read_from_interactive_tracker_state(self):
+        logits = np.array([[[[-2.0, 2.0]]]], dtype=np.float32)
+        tracker = sam3_wrapper_hf.SAM3VideoTracker.__new__(sam3_wrapper_hf.SAM3VideoTracker)
+        tracker.predictor = types.SimpleNamespace(
+            _all_inference_states={
+                "session": {
+                    "state": {
+                        "tracker_inference_states": [{
+                            "obj_id_to_idx": {1: 0},
+                            "temp_output_dict_per_obj": {
+                                0: {
+                                    "cond_frame_outputs": {0: {"pred_masks": logits}},
+                                    "non_cond_frame_outputs": {},
+                                }
+                            },
+                            "output_dict_per_obj": {},
+                        }]
+                    }
+                }
+            }
+        )
+
+        response = {"outputs": {"out_obj_ids": [1], "out_binary_masks": [logits > 0]}}
+        tracker._attach_point_mask_logits("session", 0, 1, response)
+
+        self.assertIs(response["outputs"]["_point_mask_logits"], logits)
+        self.assertEqual(response["outputs"]["_point_mask_logits_obj_id"], 1)
+
     def test_sam_preview_uses_exact_cached_jpeg_bytes(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             source_path = Path(tmpdir) / 'cached.jpg'

@@ -4268,6 +4268,10 @@ with gr.Blocks(title='VideoMaMa Production Sequence App', css=APP_CSS, js=APP_JS
                     sam_output_prob_thresh = gr.Slider(
                         label='SAM Mask Threshold', minimum=0.1, maximum=0.9,
                         value=_settings['sam_output_prob_thresh'], step=0.01,
+                        info=(
+                            'Probability cutoff applied to SAM point-mask logits. '
+                            'Higher values tighten the overlay and generated masks.'
+                        ),
                     )
                     sam_refine_edges_against_plate = gr.Checkbox(
                         label='Smooth/Snap SAM Boundary (avoid for hair)',

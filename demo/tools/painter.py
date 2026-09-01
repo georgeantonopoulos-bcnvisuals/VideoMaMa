@@ -57,9 +57,14 @@ def mask_painter(input_image, input_mask, mask_color=5, mask_alpha=0.7,
     
     # Draw contour
     if contour_width > 0:
+        # Keep hole contours as well as the outer silhouette. Negative SAM
+        # prompts commonly create enclosed background regions (for example,
+        # between an arm and the body); RETR_EXTERNAL made those successful
+        # exclusions invisible in the overlay even though the binary mask was
+        # correct.
         contours, _ = cv2.findContours(
             input_mask.astype(np.uint8), 
-            cv2.RETR_EXTERNAL, 
+            cv2.RETR_CCOMP,
             cv2.CHAIN_APPROX_SIMPLE
         )
         cv2.drawContours(

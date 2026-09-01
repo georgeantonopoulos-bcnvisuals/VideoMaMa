@@ -6,6 +6,7 @@ preview a prompted frame, and propagate prompted keyframes through a JPEG
 sequence directory.
 """
 
+import math
 import os
 import shutil
 import tempfile
@@ -142,10 +143,103 @@ class SAM3VideoTracker:
     def _relative_points(self, points, width, height):
         return [[x / width, y / height] for x, y in points]
 
-    def _extract_mask(self, outputs, frame_shape, obj_id: int = 1):
+    @staticmethod
+    def _mask_from_logits(mask_logits, frame_shape, mask_threshold: float) -> np.ndarray:
+        """Resize raw SAM mask logits and apply a real probability threshold."""
+        height, width = frame_shape
+        threshold = max(0.01, min(float(mask_threshold), 0.99))
+        logit_threshold = math.log(threshold / (1.0 - threshold))
+
+        if hasattr(mask_logits, "detach"):
+            import torch
+            import torch.nn.functional as torch_functional
+
+            logits = mask_logits.detach().float()
+            while logits.ndim > 2 and logits.shape[0] == 1:
+                logits = logits[0]
+            if logits.ndim != 2:
+                logits = logits.squeeze()
+            if logits.ndim != 2:
+                raise ValueError(f"Unexpected SAM mask-logit shape: {tuple(logits.shape)}")
+            if tuple(logits.shape) != (height, width):
+                logits = torch_functional.interpolate(
+                    logits[None, None],
+                    size=(height, width),
+                    mode="bilinear",
+                    align_corners=False,
+                )[0, 0]
+            return ((logits >= logit_threshold).to(torch.uint8).cpu().numpy() * 255)
+
+        logits = np.asarray(mask_logits, dtype=np.float32)
+        while logits.ndim > 2 and logits.shape[0] == 1:
+            logits = logits[0]
+        if logits.ndim != 2 and logits.size == height * width:
+            logits = logits.reshape(height, width)
+        if logits.ndim != 2:
+            raise ValueError(f"Unexpected SAM mask-logit shape: {logits.shape}")
+        if logits.shape != (height, width):
+            logits = np.asarray(
+                Image.fromarray(logits, mode="F").resize(
+                    (width, height), Image.Resampling.BILINEAR
+                ),
+                dtype=np.float32,
+            )
+        return ((logits >= logit_threshold).astype(np.uint8) * 255)
+
+    def _point_mask_logits(self, session_id: str, frame_idx: int, obj_id: int):
+        """Read the raw point-mask logits retained by SAM's interactive tracker."""
+        sessions = getattr(self.predictor, "_all_inference_states", {})
+        session = sessions.get(session_id)
+        if session is None and hasattr(self.predictor, "_get_session"):
+            session = self.predictor._get_session(session_id)
+        inference_state = session.get("state", {}) if isinstance(session, dict) else {}
+
+        tracker_states = list(inference_state.get("tracker_inference_states") or [])
+        tracker_states.extend(inference_state.get("sam2_inference_states") or [])
+        for tracker_state in tracker_states:
+            obj_id_to_idx = tracker_state.get("obj_id_to_idx") or {}
+            if obj_id not in obj_id_to_idx:
+                continue
+            obj_idx = int(obj_id_to_idx[obj_id])
+            for outputs_by_kind in (
+                tracker_state.get("temp_output_dict_per_obj", {}).get(obj_idx, {}),
+                tracker_state.get("output_dict_per_obj", {}).get(obj_idx, {}),
+            ):
+                for storage_key in ("cond_frame_outputs", "non_cond_frame_outputs"):
+                    frame_output = outputs_by_kind.get(storage_key, {}).get(int(frame_idx))
+                    if not frame_output:
+                        continue
+                    logits = frame_output.get("pred_masks_video_res")
+                    if logits is None:
+                        logits = frame_output.get("pred_masks")
+                    if logits is not None:
+                        return logits
+        return None
+
+    def _attach_point_mask_logits(self, session_id: str, frame_idx: int, obj_id: int, response):
+        """Add private raw logits to an in-process response for thresholding."""
+        logits = self._point_mask_logits(session_id, frame_idx, obj_id)
+        outputs = response.get("outputs") if isinstance(response, dict) else None
+        if logits is not None and isinstance(outputs, dict):
+            outputs["_point_mask_logits"] = logits
+            outputs["_point_mask_logits_obj_id"] = int(obj_id)
+        return response
+
+    def _extract_mask(
+        self,
+        outputs,
+        frame_shape,
+        obj_id: int = 1,
+        mask_threshold: float = 0.5,
+    ):
         height, width = frame_shape
         if not outputs:
             return np.zeros((height, width), dtype=np.uint8)
+
+        mask_logits = outputs.get("_point_mask_logits")
+        logits_obj_id = int(outputs.get("_point_mask_logits_obj_id", obj_id))
+        if mask_logits is not None and logits_obj_id == int(obj_id):
+            return self._mask_from_logits(mask_logits, frame_shape, mask_threshold)
 
         object_ids = outputs.get("out_obj_ids")
         masks = outputs.get("out_binary_masks")
@@ -261,7 +355,7 @@ class SAM3VideoTracker:
 
         points = self._relative_points(prompt_data["points"], width, height)
         labels = [int(label) for label in prompt_data["labels"]]
-        return self.predictor.handle_request(
+        response = self.predictor.handle_request(
             request={
                 "type": "add_prompt",
                 "session_id": session_id,
@@ -272,6 +366,7 @@ class SAM3VideoTracker:
                 "output_prob_thresh": float(output_prob_thresh),
             }
         )
+        return self._attach_point_mask_logits(session_id, frame_idx, obj_id, response)
 
     def _add_text_prompt(self, session_id: str, frame_idx: int, text: str, output_prob_thresh: float = 0.5):
         text = str(text or "").strip()
@@ -333,7 +428,10 @@ class SAM3VideoTracker:
                 # tensors until the loop ends lets later keyframes mutate an
                 # earlier artist-approved result.
                 keyframe_masks[frame_idx] = self._extract_mask(
-                    response.get("outputs", {}), (height, width), obj_id=obj_id
+                    response.get("outputs", {}),
+                    (height, width),
+                    obj_id=obj_id,
+                    mask_threshold=output_prob_thresh,
                 ).copy()
 
             final_masks = [
@@ -386,8 +484,12 @@ class SAM3VideoTracker:
                     }
                 ):
                     frame_idx = int(response["frame_index"])
+                    self._attach_point_mask_logits(session_id, frame_idx, obj_id, response)
                     propagated_mask = self._extract_mask(
-                        response.get("outputs", {}), (height, width), obj_id=obj_id
+                        response.get("outputs", {}),
+                        (height, width),
+                        obj_id=obj_id,
+                        mask_threshold=output_prob_thresh,
                     )
                     if frame_idx in keyframe_masks:
                         exact_mask = keyframe_masks[frame_idx]
@@ -552,7 +654,12 @@ class SAM3VideoTracker:
                     obj_id=1,
                     output_prob_thresh=output_prob_thresh,
                 )
-                return self._extract_mask(response.get("outputs", {}), (height, width), obj_id=1)
+                return self._extract_mask(
+                    response.get("outputs", {}),
+                    (height, width),
+                    obj_id=1,
+                    mask_threshold=output_prob_thresh,
+                )
             finally:
                 self._close_session(session_id)
         finally:
@@ -593,7 +700,12 @@ class SAM3VideoTracker:
                     obj_id=1,
                     output_prob_thresh=output_prob_thresh,
                 )
-                return self._extract_mask(response.get("outputs", {}), (height, width), obj_id=1)
+                return self._extract_mask(
+                    response.get("outputs", {}),
+                    (height, width),
+                    obj_id=1,
+                    mask_threshold=output_prob_thresh,
+                )
             finally:
                 self._close_session(session_id)
         finally:
